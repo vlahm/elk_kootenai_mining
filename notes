@@ -1,0 +1,20 @@
+think about stream reach problem:
+	need to pair chemistry with macroinverts
+	samples taken out of time, but we're thinking within a season is good enough
+		assuming samples are really only collected for a few months, maybe april to july
+	spatial matchups will be a different beast:
+		stream distance will be one metric (we already have the points snapped)
+		other thing will be interfering tributaries.
+		finally, canadian streamlines have different scale and reach definition?
+		approach:
+			see how many samples we lose by requiring samples to coincide on the same reach
+			if too many, start including things like nearby reaches, allowing 1 or more tribs, etc
+
+access to all the points in both countries? pretty sure this was on a gdrive bridget sent. if not, lauren probs has it
+
+volume change from DEMs?
+	mine footprints probably haven't changed much, but they have gotten deeper
+	can we determine this from DEMS?
+	any thinking I can do about that to help?
+		really just need the highest res DEMs possible
+
