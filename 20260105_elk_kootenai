@@ -2,7 +2,7 @@ https://drive.google.com/drive/folders/1L2KsWkMaomDmjytxVLeQGKWXCTADFFgh
 https://drive.google.com/drive/folders/1Ho8lCCK5d2TpSRjPg_5GSk6Uw7Nsl77Q
 
 GLC_FCS30D global 30-meter landcover change dataset
-delineate 288 watersheds and send. do not 
+delineate 288 watersheds and send.
 delineate all chemistry points too
 	(not including cond)
 	(or just the ones with 10yrs)
@@ -21,8 +21,6 @@ boundary waters treaty
 determine mine depth change from high-res dem
 	High Resolution Digital Elevation Model (HRDEM) - CanElevation Series
 	
-girding
-
 1. locate mines (or crawl for them one-by one and proceed through these steps)
 2. filter to those upstream of marginalized communities
 3. (first pass: filter to those with an official company/government imapct report)
