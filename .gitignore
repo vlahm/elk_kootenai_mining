@@ -4,3 +4,5 @@
 .Ruserdata
 *.swp
 data/
+rosm.cache/
+ws_png/
