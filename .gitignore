@@ -7,3 +7,4 @@ data/
 rosm.cache/
 ws_png/
 .aider*
+logs/
