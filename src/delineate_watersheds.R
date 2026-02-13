@@ -591,58 +591,95 @@ if (!'LevelPathI' %in% names(flines)) {
   }
 }
 
+# Build a fast adjacency list for upstream traversal.
+# Each flowline has a HydroSeq (its own topo sort) and DnHydroSeq (its
+# downstream neighbour's topo sort).  We invert this to get a mapping
+# from each HydroSeq → all COMIDs whose DnHydroSeq equals it, i.e. its
+# upstream children.  Then we also need a COMID → HydroSeq lookup so we
+# can start the walk from a target COMID.
+
+log_msg('Building upstream adjacency list...')
+
 fl_net <- flines %>%
   st_drop_geometry() %>%
-  select(-any_of(c('HydroSeq.y', 'DnHydroSeq.y'))) %>% 
   select(COMID,
          any_of(c('HydroSeq', 'Hydroseq', 'HydroSeq.x',
-                   'DnHydroSeq', 'DnHydroseq', 'DnHydroSeq.x',
-                   'LevelPathI'))) %>%
-  # normalise to hydroloom names expected by get_UT
-  rename_with(~ 'topo_sort',    .cols = any_of(c('HydroSeq', 'Hydroseq', 'HydroSeq.x'))) %>%
-  rename_with(~ 'dn_topo_sort', .cols = any_of(c('DnHydroSeq', 'DnHydroseq', 'DnHydroSeq.x'))) %>%
-  rename_with(~ 'levelpath',    .cols = any_of('LevelPathI')) %>%
-  rename(id = COMID)
+                   'DnHydroSeq', 'DnHydroseq', 'DnHydroSeq.x'))) %>%
+  rename_with(~ 'HydroSeq',   .cols = any_of(c('Hydroseq', 'HydroSeq.x'))) %>%
+  rename_with(~ 'DnHydroSeq', .cols = any_of(c('DnHydroseq', 'DnHydroSeq.x'))) %>%
+  filter(!is.na(HydroSeq), !is.na(DnHydroSeq))
 
-# determine column names for network traversal
-from_col <- 'id'
+# COMID → HydroSeq lookup (named vector, character keys for env lookup)
+comid_to_hs <- setNames(fl_net$HydroSeq, as.character(fl_net$COMID))
 
-# verify required columns
-ut_required <- c('id', 'levelpath', 'topo_sort', 'dn_topo_sort')
-ut_present <- intersect(ut_required, names(fl_net))
-ut_missing <- setdiff(ut_required, names(fl_net))
-log_msg('get_UT required columns present: ',
-        paste(ut_present, collapse = ', '))
-if (length(ut_missing) > 0) {
-  log_msg('WARNING: get_UT missing columns: ',
-          paste(ut_missing, collapse = ', '))
+# HydroSeq → COMID lookup
+hs_to_comid <- setNames(fl_net$COMID, as.character(fl_net$HydroSeq))
+
+# Build children map: DnHydroSeq → vector of upstream COMIDs
+# (i.e. all COMIDs that drain INTO a given HydroSeq)
+children_env <- new.env(hash = TRUE, parent = emptyenv(),
+                        size = as.integer(nrow(fl_net) * 1.3))
+for (i in seq_len(nrow(fl_net))) {
+  key <- as.character(fl_net$DnHydroSeq[i])
+  cid <- fl_net$COMID[i]
+  if (exists(key, envir = children_env, inherits = FALSE)) {
+    assign(key, c(get(key, envir = children_env), cid),
+           envir = children_env)
+  } else {
+    assign(key, cid, envir = children_env)
+  }
 }
-log_msg('fl_net columns: ', paste(names(fl_net), collapse = ', '),
-        console = FALSE)
-log_msg('fl_net: ', nrow(fl_net), ' rows')
 
-# function to get all upstream COMIDs (including the target)
-get_upstream_comids <- function(target_comid, fl_net, from_col) {
-  # use nhdplusTools built-in network navigation
-  # get_UT expects a data.frame with: id, levelpath, topo_sort, dn_topo_sort
-  ut <- tryCatch(
-    get_UT(fl_net, target_comid),
-    error = function(e) {
-      warning('get_UT failed for COMID ', target_comid, ': ',
-              conditionMessage(e))
-      return(target_comid)
+log_msg('Adjacency list built: ', length(comid_to_hs), ' flowlines, ',
+        length(ls(children_env)), ' unique downstream nodes')
+
+# Fast upstream traversal using pre-built adjacency list (BFS).
+# Returns all COMIDs upstream of (and including) target_comid.
+# Uses an environment as a visited set for O(1) lookups.
+get_upstream_comids <- function(target_comid, comid_to_hs, children_env) {
+  hs <- comid_to_hs[as.character(target_comid)]
+  if (is.na(hs)) return(target_comid)  # not in network
+
+  visited_env <- new.env(hash = TRUE, parent = emptyenv(), size = 1000L)
+  result <- vector('list', 1000L)
+  n <- 0L
+  queue <- target_comid
+
+  while (length(queue) > 0) {
+    current <- queue[1L]
+    queue <- queue[-1L]
+    ckey <- as.character(current)
+    if (exists(ckey, envir = visited_env, inherits = FALSE)) next
+    assign(ckey, TRUE, envir = visited_env)
+    n <- n + 1L
+    if (n > length(result)) {
+      result <- c(result, vector('list', length(result)))
     }
-  )
-  return(ut)
+    result[[n]] <- current
+
+    # find children: COMIDs whose DnHydroSeq == current's HydroSeq
+    cur_hs <- as.character(comid_to_hs[ckey])
+    if (!is.na(cur_hs) &&
+        exists(cur_hs, envir = children_env, inherits = FALSE)) {
+      kids <- get(cur_hs, envir = children_env)
+      # only enqueue unvisited
+      for (k in kids) {
+        if (!exists(as.character(k), envir = visited_env, inherits = FALSE)) {
+          queue <- c(queue, k)
+        }
+      }
+    }
+  }
+  return(unlist(result[seq_len(n)]))
 }
 
 # function to delineate a watershed by dissolving ALL upstream catchments
 # get_UT walks the full network upstream via hydrosequence, so the result
 # is the entire contributing area above the target reach, not just the
 # immediate local catchment.
-delineate_hr_watershed <- function(target_comid, fl_net, catchments,
-                                   from_col, catch_id_col) {
-  upstream_ids <- get_upstream_comids(target_comid, fl_net, from_col)
+delineate_hr_watershed <- function(target_comid, comid_to_hs, children_env,
+                                   catchments, catch_id_col) {
+  upstream_ids <- get_upstream_comids(target_comid, comid_to_hs, children_env)
 
   # upstream_ids come from fl_net$id which holds NHDPlusID values
   upstream_catches <- catchments[catchments[[catch_id_col]] %in% upstream_ids, ]
@@ -677,8 +714,8 @@ log_msg('--- TEST: site_id = ', test_site$site_id,
         ', COMID = ', test_comid,
         ' (', test_site$lat, ', ', test_site$lon, ') ---')
 
-test_basin <- delineate_hr_watershed(test_comid, fl_net, catchments,
-                                     from_col, catch_id_col)
+test_basin <- delineate_hr_watershed(test_comid, comid_to_hs, children_env,
+                                     catchments, catch_id_col)
 
 if (!is.null(test_basin) && nrow(test_basin) > 0) {
   log_msg('  Upstream COMIDs: ', test_basin$n_upstream,
@@ -732,8 +769,8 @@ for(i in seq_along(todo_comids)){
   if(i %% 50 == 0) message('  progress: ', i, ' / ', length(todo_comids))
 
   z <- try({
-    basin <- delineate_hr_watershed(cid, fl_net, catchments,
-                                    from_col, catch_id_col)
+    basin <- delineate_hr_watershed(cid, comid_to_hs, children_env,
+                                    catchments, catch_id_col)
     if(is.null(basin) || nrow(basin) == 0) stop('empty basin')
     st_write(basin, outfile, delete_dsn = TRUE, quiet = TRUE)
   }, silent = TRUE)
