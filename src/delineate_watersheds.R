@@ -67,9 +67,43 @@ conc <- read_xlsx('data/ChemConLoc.xlsx') %>%
 sites <- bind_rows(macro, conc)
 
 
-## link sites to NHDPlus COMIDs ####
+## filter sites to Elk-Kootenai study area ####
 
 sites_sf <- st_as_sf(sites, coords = c('lon', 'lat'), crs = 4326)
+
+# use HUC4 boundary to keep only sites within the study basin
+# try cached boundary first, then read from GDB
+huc4_boundary_file <- file.path(hr_dir, 'huc4_boundary.gpkg')
+if (file.exists(huc4_boundary_file)) {
+  huc4_boundary <- st_read(huc4_boundary_file, quiet = TRUE)
+} else {
+  # find the GDB to read WBDHU4 from
+  gdb_path <- list.dirs(hr_dir, full.names = TRUE, recursive = TRUE)
+  gdb_path <- gdb_path[grepl('\\.gdb$', gdb_path)][1]
+  if (!is.na(gdb_path) && 'WBDHU4' %in% st_layers(gdb_path)$name) {
+    huc4_boundary <- st_read(gdb_path, layer = 'WBDHU4', quiet = TRUE)
+    st_write(huc4_boundary, huc4_boundary_file, quiet = TRUE)
+  } else {
+    # fallback: use a bounding box for HUC 1701 (approximate)
+    log_msg('WARNING: WBDHU4 layer not found — using approximate bbox for 1701')
+    huc4_boundary <- st_as_sf(
+      st_as_sfc(st_bbox(c(xmin = -117.5, ymin = 46.5,
+                           xmax = -114.0, ymax = 49.5),
+                         crs = 4326))
+    )
+  }
+}
+
+huc4_boundary <- st_transform(huc4_boundary, st_crs(sites_sf))
+in_basin <- st_intersects(sites_sf, st_union(huc4_boundary), sparse = FALSE)[, 1]
+n_before <- nrow(sites)
+sites <- sites[in_basin, ]
+sites_sf <- sites_sf[in_basin, ]
+log_msg('Filtered sites to study area: ', nrow(sites), ' of ', n_before,
+        ' sites retained')
+
+
+## link sites to NHDPlus COMIDs ####
 
 # discover_nhdplus_id finds the nearest NHDPlus COMID for each point
 # NOTE: this uses NHDPlus Medium Resolution (1:100K). Small headwater
@@ -124,6 +158,33 @@ if (file.exists(hr_gpkg)) {
         log_msg('WARNING: cached flowlines missing ToMeas — defaulting to 100')
         flines$ToMeas <- 100
       }
+
+      # ensure VAA network columns needed by get_UT are present
+      needed_vaa_cols <- c('HydroSeq', 'DnHydroSeq', 'LevelPathI')
+      missing_net <- setdiff(needed_vaa_cols, names(flines))
+      if (length(missing_net) > 0) {
+        log_msg('Cached flowlines missing VAA network columns: ',
+                paste(missing_net, collapse = ', '),
+                ' — joining from source...')
+        gdb_path <- list.dirs(hr_dir, full.names = TRUE, recursive = TRUE)
+        gdb_path <- gdb_path[grepl('\\.gdb$', gdb_path)][1]
+        if (!is.na(gdb_path)) {
+          vaa_net <- st_read(gdb_path, layer = 'NHDPlusFlowlineVAA',
+                             quiet = TRUE) %>%
+            select(any_of(c('NHDPlusID', needed_vaa_cols)))
+          # determine join key on flines side
+          join_key <- if ('NHDPlusID' %in% names(flines)) 'NHDPlusID' else 'COMID'
+          join_by <- setNames('NHDPlusID', join_key)
+          flines <- flines %>%
+            left_join(st_drop_geometry(vaa_net), by = join_by)
+          log_msg('Joined VAA network columns from GDB: ',
+                  paste(intersect(needed_vaa_cols, names(flines)),
+                        collapse = ', '))
+        } else {
+          log_msg('WARNING: no GDB found to read VAA network columns')
+        }
+      }
+
       log_msg('Cached flowlines: ', nrow(flines), ' rows, ',
               ncol(flines), ' columns')
       log_msg('Columns: ', paste(names(flines), collapse = ', '),
@@ -247,8 +308,8 @@ if (!file.exists(hr_gpkg)) {
   # VAA has ToMeas/FromMeas (or Pathlength, etc.)
   # get_flowline_index needs: COMID, REACHCODE, ToMeas, FromMeas
   wanted_vaa <- c('NHDPlusID', 'ToMeas', 'FromMeas',
-                   'Hydroseq', 'DnHydroseq',
-                   'UpHydroseq', 'StartFlag',
+                   'HydroSeq', 'DnHydroSeq',
+                   'UpHydroSeq', 'LevelPathI', 'StartFlag',
                    'StreamOrde', 'StreamCalc',
                    'TotDASqKm', 'DivDASqKm')
   vaa_cols <- intersect(names(vaa), wanted_vaa)
@@ -376,24 +437,41 @@ if (length(missing_cols) > 0) {
 }
 
 # --- snap sites to HR flowlines using get_flowline_index ---
-log_msg('Running get_flowline_index (search_radius = 500m)...')
-fi <- tryCatch(
-  get_flowline_index(
-    flines,
-    sites_sf,
-    search_radius = units::set_units(50, 'm')
-  ),
-  error = function(e) {
-    log_msg('ERROR in get_flowline_index: ', conditionMessage(e))
-    log_msg('Flowline columns at call time: ',
-            paste(names(flines), collapse = ', '), console = FALSE)
-    log_msg('Flowline nrow: ', nrow(flines), ', CRS: ',
-            st_crs(flines)$input, console = FALSE)
-    stop('get_flowline_index failed. See ', log_file, ' for details.',
-         call. = FALSE)
-  }
-)
-# saveRDS(fi, 'data/flowline_indices.rds')
+
+fi_cache <- 'data/flowline_indices.rds'
+
+if (file.exists(fi_cache)) {
+  log_msg('Loading cached flowline indices from ', fi_cache)
+  fi <- readRDS(fi_cache)
+  log_msg('Loaded ', nrow(fi), ' flowline index rows from cache')
+} else {
+  # pre-process flowlines: match CRS, drop Z, cast to LINESTRING
+  flines_idx <- flines %>%
+    st_transform(st_crs(sites_sf)) %>%
+    st_zm(drop = TRUE, what = 'ZM') %>%
+    st_cast('LINESTRING')
+
+  log_msg('Running get_flowline_index (search_radius = 50m)...')
+  fi <- tryCatch(
+    get_flowline_index(
+      flines_idx,
+      sites_sf,
+      search_radius = units::set_units(50, 'm')
+    ),
+    error = function(e) {
+      log_msg('ERROR in get_flowline_index: ', conditionMessage(e))
+      log_msg('Flowline columns at call time: ',
+              paste(names(flines), collapse = ', '), console = FALSE)
+      log_msg('Flowline nrow: ', nrow(flines), ', CRS: ',
+              st_crs(flines)$input, console = FALSE)
+      stop('get_flowline_index failed. See ', log_file, ' for details.',
+           call. = FALSE)
+    }
+  )
+  rm(flines_idx)  # free memory
+  saveRDS(fi, fi_cache)
+  log_msg('Saved flowline indices to ', fi_cache)
+}
 log_msg('get_flowline_index returned ', nrow(fi), ' rows')
 
 # fi has columns: id (row index), COMID, REACHCODE, REACH_meas, offset
@@ -435,7 +513,7 @@ log_msg('  Median: ', round(median(snap_dist_m, na.rm = TRUE), 1))
 log_msg('  Mean:   ', round(mean(snap_dist_m, na.rm = TRUE), 1))
 log_msg('  Max:    ', round(max(snap_dist_m, na.rm = TRUE), 1))
 
-snap_threshold_m <- 20
+snap_threshold_m <- 50
 n_suspect <- sum(snap_dist_m > snap_threshold_m, na.rm = TRUE)
 log_msg('  Sites > ', snap_threshold_m, 'm from nearest flowline: ', n_suspect)
 if (n_suspect > 0) {
@@ -452,7 +530,7 @@ write_csv(st_drop_geometry(sites_with_comid),
 log_msg('Wrote snap-distance diagnostics: ',
         file.path(ws_dir, 'site_snap_distances.csv'))
 
-sites_valid <- filter(sites, !is.na(comid))
+sites_valid <- filter(sites, !is.na(comid), !site_id %in% suspect_sites$site_id)
 
 # build lookup: site_id -> comid (many sites may share a reach)
 site_comid_lookup <- sites_valid %>%
@@ -478,49 +556,112 @@ log_msg('Loaded ', nrow(catchments), ' HR catchments')
 catch_id_col <- if ('NHDPlusID' %in% names(catchments)) 'NHDPlusID' else 'FEATUREID'
 
 # build a simple network lookup from the flowlines for upstream traversal
-# HR flowlines have a ToNHDPID or similar downstream pointer
-fl_net <- flines %>%
-  st_drop_geometry()
+# get_UT (hydroloom) requires: id, levelpath, topo_sort, dn_topo_sort
+# These map from NHDPlus HR columns as follows:
+#   id          <- COMID (= NHDPlusID)
+#   topo_sort   <- HydroSeq
+#   dn_topo_sort <- DnHydroSeq
+#   levelpath   <- LevelPathI
 
-# determine column names for network traversal
-from_col <- if ('NHDPlusID' %in% names(fl_net)) 'NHDPlusID' else 'COMID'
-to_col <- if ('DnHydroSeq' %in% names(fl_net)) {
-  # use hydrosequence-based navigation
-  NULL
-} else if ('ToNHDPID' %in% names(fl_net)) {
-  'ToNHDPID'
-} else {
-  NULL
+# first, read LevelPathI from VAA if not already on flines
+if (!'LevelPathI' %in% names(flines)) {
+  # try to get it from the cached gpkg or GDB
+  log_msg('LevelPathI not on flines — reading from source...')
+  if (file.exists(hr_gpkg)) {
+    # check if VAA was cached as a layer
+    gpkg_lyrs <- st_layers(hr_gpkg)$name
+    if ('NHDPlusFlowlineVAA' %in% gpkg_lyrs) {
+      vaa_lp <- st_read(hr_gpkg, layer = 'NHDPlusFlowlineVAA', quiet = TRUE) %>%
+        select(any_of(c('NHDPlusID', 'LevelPathI')))
+    } else {
+      # read from original GDB
+      gdb_path <- list.dirs(hr_dir, full.names = TRUE, recursive = TRUE)
+      gdb_path <- gdb_path[grepl('\\.gdb$', gdb_path)][1]
+      vaa_lp <- st_read(gdb_path, layer = 'NHDPlusFlowlineVAA', quiet = TRUE) %>%
+        select(any_of(c('NHDPlusID', 'LevelPathI')))
+    }
+    if ('LevelPathI' %in% names(vaa_lp)) {
+      flines <- flines %>%
+        left_join(st_drop_geometry(vaa_lp), by = c('COMID' = 'NHDPlusID'))
+      log_msg('Joined LevelPathI: ', sum(!is.na(flines$LevelPathI)),
+              ' of ', nrow(flines), ' flowlines matched')
+    } else {
+      log_msg('WARNING: LevelPathI not found in VAA table')
+    }
+  }
 }
 
-log_msg('Network columns: from=', from_col,
-        ', to=', if (is.null(to_col)) 'hydroseq-based' else to_col)
+fl_net <- flines %>%
+  st_drop_geometry() %>%
+  select(-any_of(c('HydroSeq.y', 'DnHydroSeq.y'))) %>% 
+  select(COMID,
+         any_of(c('HydroSeq', 'Hydroseq', 'HydroSeq.x',
+                   'DnHydroSeq', 'DnHydroseq', 'DnHydroSeq.x',
+                   'LevelPathI'))) %>%
+  # normalise to hydroloom names expected by get_UT
+  rename_with(~ 'topo_sort',    .cols = any_of(c('HydroSeq', 'Hydroseq', 'HydroSeq.x'))) %>%
+  rename_with(~ 'dn_topo_sort', .cols = any_of(c('DnHydroSeq', 'DnHydroseq', 'DnHydroSeq.x'))) %>%
+  rename_with(~ 'levelpath',    .cols = any_of('LevelPathI')) %>%
+  rename(id = COMID)
+
+# determine column names for network traversal
+from_col <- 'id'
+
+# verify required columns
+ut_required <- c('id', 'levelpath', 'topo_sort', 'dn_topo_sort')
+ut_present <- intersect(ut_required, names(fl_net))
+ut_missing <- setdiff(ut_required, names(fl_net))
+log_msg('get_UT required columns present: ',
+        paste(ut_present, collapse = ', '))
+if (length(ut_missing) > 0) {
+  log_msg('WARNING: get_UT missing columns: ',
+          paste(ut_missing, collapse = ', '))
+}
+log_msg('fl_net columns: ', paste(names(fl_net), collapse = ', '),
+        console = FALSE)
+log_msg('fl_net: ', nrow(fl_net), ' rows')
 
 # function to get all upstream COMIDs (including the target)
 get_upstream_comids <- function(target_comid, fl_net, from_col) {
   # use nhdplusTools built-in network navigation
+  # get_UT expects a data.frame with: id, levelpath, topo_sort, dn_topo_sort
   ut <- tryCatch(
     get_UT(fl_net, target_comid),
-    error = function(e) target_comid
+    error = function(e) {
+      warning('get_UT failed for COMID ', target_comid, ': ',
+              conditionMessage(e))
+      return(target_comid)
+    }
   )
   return(ut)
 }
 
-# function to delineate a watershed by dissolving upstream catchments
+# function to delineate a watershed by dissolving ALL upstream catchments
+# get_UT walks the full network upstream via hydrosequence, so the result
+# is the entire contributing area above the target reach, not just the
+# immediate local catchment.
 delineate_hr_watershed <- function(target_comid, fl_net, catchments,
                                    from_col, catch_id_col) {
   upstream_ids <- get_upstream_comids(target_comid, fl_net, from_col)
+
+  # upstream_ids come from fl_net$id which holds NHDPlusID values
   upstream_catches <- catchments[catchments[[catch_id_col]] %in% upstream_ids, ]
 
   if (nrow(upstream_catches) == 0) {
-    warning('No catchments found for COMID ', target_comid)
+    warning('No catchments found for COMID ', target_comid,
+            ' (', length(upstream_ids), ' upstream COMIDs)')
     return(NULL)
   }
 
   # dissolve all upstream catchments into one polygon
   basin <- upstream_catches %>%
+    st_make_valid() %>%
     st_union() %>%
-    st_sf(comid = target_comid, geometry = .)
+    st_sf(comid = target_comid,
+          n_upstream = length(upstream_ids),
+          n_catchments = nrow(upstream_catches),
+          geometry = .) %>%
+    st_make_valid()
 
   return(basin)
 }
@@ -528,6 +669,7 @@ delineate_hr_watershed <- function(target_comid, fl_net, catchments,
 
 ## single-site test ####
 
+# from_col is now 'id' to match fl_net; catch_id_col matches catchments
 test_comid <- unique_comids[1]
 test_site <- sites_valid %>% filter(comid == test_comid) %>% slice(1)
 
@@ -539,7 +681,9 @@ test_basin <- delineate_hr_watershed(test_comid, fl_net, catchments,
                                      from_col, catch_id_col)
 
 if (!is.null(test_basin) && nrow(test_basin) > 0) {
-  test_file <- file.path(ws_dir, paste0('comid_', test_comid, '.shp'))
+  log_msg('  Upstream COMIDs: ', test_basin$n_upstream,
+          ', catchments dissolved: ', test_basin$n_catchments)
+  test_file <- file.path(ws_dir, paste0('comid_', test_comid, '.gpkg'))
   st_write(test_basin, test_file, delete_dsn = TRUE, quiet = TRUE)
   log_msg('TEST SUCCESS: wrote ', test_file)
 
@@ -557,51 +701,67 @@ log_msg('Full log written to: ', log_file)
 ## delineate all unique reaches ####
 ## (uncomment the block below to run the full loop)
 
-# already_done <- list.files(ws_dir, pattern = 'comid_.*\\.shp$') %>%
-#   str_extract('comid_([0-9]+)', group = 1) %>%
-#   as.numeric()
-# 
-# todo_comids <- setdiff(unique_comids, already_done)
-# message(length(todo_comids), ' COMIDs remaining to delineate')
-# 
-# outcomes <- tibble(comid = integer(), status = character(), msg = character())
-# 
-# for(i in seq_along(todo_comids)){
-# 
-#   cid <- todo_comids[i]
-#   outfile <- file.path(ws_dir, paste0('comid_', cid, '.shp'))
-# 
-#   if(i %% 50 == 0) message('  progress: ', i, ' / ', length(todo_comids))
-# 
-#   z <- try({
-#     basin <- delineate_hr_watershed(cid, fl_net, catchments,
-#                                     from_col, catch_id_col)
-#     if(is.null(basin) || nrow(basin) == 0) stop('empty basin')
-#     st_write(basin, outfile, delete_dsn = TRUE, quiet = TRUE)
-#   }, silent = TRUE)
-# 
-#   if(inherits(z, 'try-error')){
-#     outcomes <- add_row(outcomes, comid = cid, status = 'error',
-#                         msg = as.character(z))
-#   } else {
-#     outcomes <- add_row(outcomes, comid = cid, status = 'success', msg = '')
-#   }
-# }
-# 
-# write_csv(outcomes, file.path(ws_dir, 'delineation_outcomes.csv'))
-# message('Done. ', sum(outcomes$status == 'success'), ' succeeded, ',
-#         sum(outcomes$status == 'error'), ' failed.')
+# read previous outcomes to identify failures that should be retried
+prev_outcomes_file <- file.path(ws_dir, 'delineation_outcomes.csv')
+prev_failures <- character()
+if (file.exists(prev_outcomes_file)) {
+  prev_outcomes <- read_csv(prev_outcomes_file, show_col_types = FALSE)
+  prev_failures <- prev_outcomes %>%
+    filter(status == 'error') %>%
+    pull(comid) %>%
+    as.character()
+  log_msg('Found ', length(prev_failures), ' previous failures to retry')
+}
+
+already_done <- list.files(ws_dir, pattern = 'comid_.*\\.gpkg$') %>%
+  str_extract('comid_([0-9e+]+)', group = 1)
+
+# remove previous failures from already_done so they get retried
+already_done <- setdiff(already_done, prev_failures)
+
+todo_comids <- setdiff(unique_comids, already_done)
+log_msg(length(todo_comids), ' COMIDs remaining to delineate')
+
+outcomes <- tibble(comid = integer(), status = character(), msg = character())
+
+for(i in seq_along(todo_comids)){
+
+  cid <- todo_comids[i]
+  outfile <- file.path(ws_dir, paste0('comid_', cid, '.gpkg'))
+
+  if(i %% 50 == 0) message('  progress: ', i, ' / ', length(todo_comids))
+
+  z <- try({
+    basin <- delineate_hr_watershed(cid, fl_net, catchments,
+                                    from_col, catch_id_col)
+    if(is.null(basin) || nrow(basin) == 0) stop('empty basin')
+    st_write(basin, outfile, delete_dsn = TRUE, quiet = TRUE)
+  }, silent = TRUE)
+
+  if(inherits(z, 'try-error')){
+    outcomes <- add_row(outcomes, comid = cid, status = 'error',
+                        msg = as.character(z))
+  } else {
+    outcomes <- add_row(outcomes, comid = cid, status = 'success', msg = '')
+  }
+}
+
+write_csv(outcomes, file.path(ws_dir, 'delineation_outcomes.csv'))
+message('Done. ', sum(outcomes$status == 'success'), ' succeeded, ',
+        sum(outcomes$status == 'error'), ' failed.')
 
 
 ## verify (optional) ####
 
-# dir.create('ws_png', showWarnings = FALSE)
-# sheds <- list.files(ws_dir, pattern = '*.shp', full.names = TRUE)
-# for(f in sheds){
-#   ws <- st_read(f, quiet = TRUE)
-#   if(!st_is_longlat(ws)) ws <- st_transform(ws, 4326)
-#   pngfile <- file.path('ws_png', paste0(basename(f), '.png'))
-#   png(pngfile, width = 900, height = 900)
-#   plot(st_geometry(ws), main = basename(f))
-#   dev.off()
-# }
+dir.create('ws_png', showWarnings = FALSE)
+sheds <- list.files(ws_dir, pattern = '*.gpkg', full.names = TRUE)
+for(f in sheds[1:10]){
+  ws <- st_read(f, quiet = TRUE)
+  if(!st_is_longlat(ws)) ws <- st_transform(ws, 4326)
+  pngfile <- file.path('ws_png', paste0(basename(f), '.png'))
+  png(pngfile, width = 900, height = 900)
+  plot(st_geometry(ws), main = basename(f))
+  dev.off()
+}
+
+
