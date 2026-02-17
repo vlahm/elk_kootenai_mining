@@ -456,7 +456,7 @@ if (file.exists(fi_cache)) {
     get_flowline_index(
       flines_idx,
       sites_sf,
-      search_radius = units::set_units(50, 'm')
+      search_radius = units::set_units(500, 'm')
     ),
     error = function(e) {
       log_msg('ERROR in get_flowline_index: ', conditionMessage(e))
@@ -502,7 +502,7 @@ fline_id_col <- if ('NHDPlusID' %in% names(flines_sf)) 'NHDPlusID' else 'COMID'
 snap_dist_m <- map_dbl(seq_len(nrow(sites_with_comid)), function(i) {
   fline <- flines_sf[flines_sf[[fline_id_col]] == sites_with_comid$comid[i], ]
   if (nrow(fline) == 0) return(NA_real_)
-  as.numeric(st_distance(sites_with_comid[i, ], fline)[1])
+  suppressMessages(as.numeric(st_distance(sites_with_comid[i, ], fline)[1]))
 })
 
 sites_with_comid$snap_dist_m <- snap_dist_m
@@ -513,7 +513,7 @@ log_msg('  Median: ', round(median(snap_dist_m, na.rm = TRUE), 1))
 log_msg('  Mean:   ', round(mean(snap_dist_m, na.rm = TRUE), 1))
 log_msg('  Max:    ', round(max(snap_dist_m, na.rm = TRUE), 1))
 
-snap_threshold_m <- 50
+snap_threshold_m <- 500
 n_suspect <- sum(snap_dist_m > snap_threshold_m, na.rm = TRUE)
 log_msg('  Sites > ', snap_threshold_m, 'm from nearest flowline: ', n_suspect)
 if (n_suspect > 0) {
@@ -633,44 +633,79 @@ for (i in seq_len(nrow(fl_net))) {
 log_msg('Adjacency list built: ', length(comid_to_hs), ' flowlines, ',
         length(ls(children_env)), ' unique downstream nodes')
 
-# Fast upstream traversal using pre-built adjacency list (BFS).
-# Returns all COMIDs upstream of (and including) target_comid.
-# Uses an environment as a visited set for O(1) lookups.
-get_upstream_comids <- function(target_comid, comid_to_hs, children_env) {
-  hs <- comid_to_hs[as.character(target_comid)]
-  if (is.na(hs)) return(target_comid)  # not in network
+# --- Pre-compute ALL upstream COMIDs in one topological sweep ---
+# Process flowlines in ascending HydroSeq order (headwaters first).
+# Each node's upstream set = itself + union of its children's upstream sets.
+# This turns per-site BFS into a single O(n) pass + O(1) lookup.
 
-  visited_env <- new.env(hash = TRUE, parent = emptyenv(), size = 1000L)
-  result <- vector('list', 1000L)
-  n <- 0L
-  queue <- target_comid
+log_msg('Pre-computing upstream COMID sets for all ',
+        nrow(fl_net), ' flowlines (topological sweep)...')
+t_precomp <- proc.time()
 
-  while (length(queue) > 0) {
-    current <- queue[1L]
-    queue <- queue[-1L]
-    ckey <- as.character(current)
-    if (exists(ckey, envir = visited_env, inherits = FALSE)) next
-    assign(ckey, TRUE, envir = visited_env)
-    n <- n + 1L
-    if (n > length(result)) {
-      result <- c(result, vector('list', length(result)))
-    }
-    result[[n]] <- current
+# In NHDPlus HR, headwaters have the HIGHEST HydroSeq values.
+# Process in descending order so children (upstream) are resolved
+# before their downstream parents.
+fl_sorted <- fl_net[order(fl_net$HydroSeq, decreasing = TRUE), ]
 
-    # find children: COMIDs whose DnHydroSeq == current's HydroSeq
-    cur_hs <- as.character(comid_to_hs[ckey])
-    if (!is.na(cur_hs) &&
-        exists(cur_hs, envir = children_env, inherits = FALSE)) {
-      kids <- get(cur_hs, envir = children_env)
-      # only enqueue unvisited
-      for (k in kids) {
-        if (!exists(as.character(k), envir = visited_env, inherits = FALSE)) {
-          queue <- c(queue, k)
-        }
-      }
+# pre-allocate list keyed by character COMID
+upstream_list <- vector('list', nrow(fl_sorted))
+names(upstream_list) <- as.character(fl_sorted$COMID)
+
+# also build a fast index: character COMID → position in upstream_list
+ul_idx <- setNames(seq_along(upstream_list), names(upstream_list))
+
+for (i in seq_len(nrow(fl_sorted))) {
+  cid <- fl_sorted$COMID[i]
+  hs_key <- as.character(fl_sorted$HydroSeq[i])
+
+  # get immediate upstream children (COMIDs whose DnHydroSeq == this HydroSeq)
+  kids <- if (exists(hs_key, envir = children_env, inherits = FALSE)) {
+    get(hs_key, envir = children_env)
+  } else {
+    NULL
+  }
+
+  if (is.null(kids) || length(kids) == 0) {
+    # headwater: upstream set is just itself
+    upstream_list[[i]] <- cid
+  } else {
+    # gather upstream sets of all children + self
+    kid_keys <- as.character(kids)
+    kid_positions <- ul_idx[kid_keys]
+    kid_positions <- kid_positions[!is.na(kid_positions)]
+
+    if (length(kid_positions) == 0) {
+      upstream_list[[i]] <- c(cid, kids)
+    } else {
+      upstream_list[[i]] <- c(cid, unique(unlist(
+        upstream_list[kid_positions], use.names = FALSE
+      )))
     }
   }
-  return(unlist(result[seq_len(n)]))
+}
+
+elapsed <- (proc.time() - t_precomp)[['elapsed']]
+total_entries <- sum(vapply(upstream_list, length, integer(1)))
+log_msg('Upstream pre-computation complete in ', round(elapsed, 1), 's')
+log_msg('  Total entries across all upstream sets: ',
+        format(total_entries, big.mark = ','),
+        ' (approx ', round(total_entries * 8 / 1e9, 2), ' GiB)')
+
+# diagnostic: distribution of upstream set sizes
+us_lengths <- vapply(upstream_list, length, integer(1))
+log_msg('  Upstream set size distribution:')
+log_msg('    Min: ', min(us_lengths), '  Median: ', median(us_lengths),
+        '  Mean: ', round(mean(us_lengths), 1), '  Max: ', max(us_lengths))
+log_msg('    Sets with >10 COMIDs: ', sum(us_lengths > 10),
+        '  >100: ', sum(us_lengths > 100),
+        '  >1000: ', sum(us_lengths > 1000))
+
+# O(1) lookup wrapper (keeps the same interface for delineate_hr_watershed)
+get_upstream_comids <- function(target_comid, comid_to_hs, children_env) {
+  key <- as.character(target_comid)
+  us <- upstream_list[[key]]
+  if (is.null(us)) return(target_comid)
+  return(us)
 }
 
 # function to delineate a watershed by dissolving ALL upstream catchments
