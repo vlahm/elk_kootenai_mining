@@ -965,8 +965,7 @@ questionables <- sites_with_comid %>%
   filter(snap_dist_m > 400)
 
 redo <- c()
-# for(i in seq_len(nrow(questionables))){
-for(i in 8:nrow(questionables)){
+for(i in seq_len(nrow(questionables))){
   
   comid <- questionables$comid[i]
   sitename <- questionables$site_id[i]
@@ -985,4 +984,17 @@ for(i in 8:nrow(questionables)){
   message('enter "x" to mark as "redo", or any other key to see next')
   input <- readLines(n = 1)
   if(input == 'x') redo <- c(redo, f)
+}
+
+
+suspect_sites <- bind_rows(
+  suspect_sites,
+  st_drop_geometry(filter(sites_with_comid, comid %in% redo))
+)
+
+write_csv(suspect_sites, 'data/watersheds_nhdhr/questionable_sheds.csv')
+
+for(cc in suspect_sites$comid){
+  file.rename(paste0('data/watersheds_nhdhr/comid_', cc, '.gpkg'),
+              paste0('data/watersheds_nhdhr/sheds_questionable/comid_', cc, '.gpkg'))
 }
