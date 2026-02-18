@@ -31,6 +31,32 @@ cat('=== delineate_watersheds.R ===\n',
 # collect warnings, print summary at end
 options(warn = 1, nwarnings = 500)
 
+## helper: remove interior holes from polygons ####
+
+# Faster than nngeo::st_remove_holes() — works directly on sf geometry.
+# For each polygon, keeps only the exterior ring (drops all holes).
+remove_holes <- function(x) {
+  geom <- st_geometry(x)
+  crs <- st_crs(geom)
+
+  no_holes <- lapply(geom, function(g) {
+    if (st_is(g, 'POLYGON')) {
+      # a POLYGON is a list of rings; first ring is exterior
+      st_polygon(list(g[[1]]))
+    } else if (st_is(g, 'MULTIPOLYGON')) {
+      # each sub-polygon: keep only exterior ring
+      # g is a list of polygons; each polygon is a list of rings
+      parts <- lapply(g, function(p) list(p[[1]]))
+      st_multipolygon(parts)
+    } else {
+      g
+    }
+  })
+
+  st_geometry(x) <- st_sfc(no_holes, crs = crs)
+  return(x)
+}
+
 ## setup ####
 
 ws_dir <- 'data/watersheds_nhdhr'
@@ -725,15 +751,34 @@ delineate_hr_watershed <- function(target_comid, comid_to_hs, children_env,
     return(NULL)
   }
 
-  # dissolve all upstream catchments into one polygon
-  basin <- upstream_catches %>%
+  # dissolve all upstream catchments into one polygon, then remove
+  # interior holes (DEM artifacts from roads, railroads, etc.)
+  # Two-pass approach:
+  #   1. remove_holes() strips interior rings (large holes)
+  #   2. buffer out then back in to close single-pixel / diagonal-adjacency
+  #      gaps that st_union leaves between adjacent catchments
+  basin_geom <- upstream_catches %>%
     st_make_valid() %>%
     st_union() %>%
-    st_sf(comid = target_comid,
-          n_upstream = length(upstream_ids),
-          n_catchments = nrow(upstream_catches),
-          geometry = .) %>%
     st_make_valid()
+
+  # close micro-gaps: buffer out 1m, then back in 1m
+  # must project to a metric CRS first so buffer distance is in meters
+  orig_crs <- st_crs(basin_geom)
+  basin_geom <- basin_geom %>%
+    st_transform(32611) %>%
+    st_buffer(1) %>%
+    st_union() %>%
+    st_make_valid() %>%
+    st_buffer(-1) %>%
+    st_make_valid() %>%
+    st_transform(orig_crs)
+
+  basin <- st_sf(comid = target_comid,
+                 n_upstream = length(upstream_ids),
+                 n_catchments = nrow(upstream_catches),
+                 geometry = basin_geom) %>%
+    remove_holes()
 
   return(basin)
 }
@@ -823,17 +868,121 @@ message('Done. ', sum(outcomes$status == 'success'), ' succeeded, ',
         sum(outcomes$status == 'error'), ' failed.')
 
 
+## retroactively fix holes in existing gpkg files ####
+
+# log_msg('\n--- Removing holes from existing watershed gpkg files ---')
+# existing_gpkgs <- list.files(ws_dir, pattern = 'comid_.*\\.gpkg$',
+#                              full.names = TRUE)
+# log_msg('Found ', length(existing_gpkgs), ' existing watershed files to fix')
+# 
+# n_fixed <- 0
+# n_had_holes <- 0
+# for (gpkg_f in existing_gpkgs) {
+#   ws <- tryCatch(st_read(gpkg_f, quiet = TRUE), error = function(e) NULL)
+#   if (is.null(ws) || nrow(ws) == 0) next
+# 
+#   # count holes before
+#   geom <- st_geometry(ws)
+#   n_holes_before <- sum(vapply(geom, function(g) {
+#     if (st_is(g, 'POLYGON')) {
+#       max(0L, length(g) - 1L)
+#     } else if (st_is(g, 'MULTIPOLYGON')) {
+#       sum(vapply(g, function(p) max(0L, length(p) - 1L), integer(1)))
+#     } else {
+#       0L
+#     }
+#   }, integer(1)))
+# 
+#   # always reprocess: previous fix attempts may have been incomplete
+#   # (broken remove_holes or lon/lat buffer)
+#   orig_crs <- st_crs(ws)
+#   ws_fixed <- ws %>%
+#     st_transform(32611) %>%
+#     st_buffer(1) %>%
+#     st_union() %>%
+#     st_make_valid() %>%
+#     st_buffer(-1) %>%
+#     st_make_valid() %>%
+#     st_transform(orig_crs) %>%
+#     st_sf(geometry = .) %>%
+#     mutate(comid = ws$comid,
+#            n_upstream = ws$n_upstream,
+#            n_catchments = ws$n_catchments) %>%
+#     remove_holes()
+# 
+#   # count holes after to report
+#   geom_after <- st_geometry(ws_fixed)
+#   n_holes_after <- sum(vapply(geom_after, function(g) {
+#     if (st_is(g, 'POLYGON')) {
+#       max(0L, length(g) - 1L)
+#     } else if (st_is(g, 'MULTIPOLYGON')) {
+#       sum(vapply(g, function(p) max(0L, length(p) - 1L), integer(1)))
+#     } else {
+#       0L
+#     }
+#   }, integer(1)))
+# 
+#   if (n_holes_before > 0) n_had_holes <- n_had_holes + 1
+#   if (n_holes_after > 0) {
+#     log_msg('  WARNING: ', basename(gpkg_f), ' still has ',
+#             n_holes_after, ' holes after fix')
+#   }
+# 
+#   st_write(ws_fixed, gpkg_f, delete_dsn = TRUE, quiet = TRUE)
+#   n_fixed <- n_fixed + 1
+#   if (n_fixed %% 50 == 0) {
+#     log_msg('  Fixed ', n_fixed, ' / ', length(existing_gpkgs), ' files...')
+#   }
+# }
+# log_msg('Hole removal complete: ', n_fixed, ' files rewritten (',
+#         n_had_holes, ' originally had holes)')
+
 ## verify (optional) ####
 
 dir.create('ws_png', showWarnings = FALSE)
 sheds <- list.files(ws_dir, pattern = '*.gpkg', full.names = TRUE)
+# lame <- c()
 for(f in sheds[1:10]){
   ws <- st_read(f, quiet = TRUE)
   if(!st_is_longlat(ws)) ws <- st_transform(ws, 4326)
   pngfile <- file.path('ws_png', paste0(basename(f), '.png'))
   png(pngfile, width = 900, height = 900)
-  plot(st_geometry(ws), main = basename(f))
+  tryres <- try(plot(st_geometry(ws), main = basename(f)), silent = TRUE)
   dev.off()
+  # if(inherits(tryres, 'try-error')) lame <- c(lame, f)
 }
 
+# for(f in lame){
+#   file.remove(f)
+# }
+# for(f in lame){
+#   file.copy(from = f, to = paste0('data/nhdhr_bak/', basename(f)))
+# }
 
+## investigate questionable snaps ####
+
+questionables <- sites_with_comid %>% 
+  filter(snap_dist_m > 400)
+
+redo <- c()
+# for(i in seq_len(nrow(questionables))){
+for(i in 8:nrow(questionables)){
+  
+  comid <- questionables$comid[i]
+  sitename <- questionables$site_id[i]
+  print(comid)
+  zshed <- try(st_read(paste0('data/watersheds_nhdhr/comid_', comid, '.gpkg')))
+  if(inherits(zshed, 'try-error')) next
+  zsite <- filter(sites_sf, site_id == sitename)
+  
+  # test_pt <- st_as_sf(test_site, coords = c('lon', 'lat'), crs = 4326)
+  print(mapview(zshed, layer.name = 'sitename') +
+        mapview(zsite, col.regions = 'red', layer.name = 'comid'))
+  
+  # ws <- st_read(f, quiet = TRUE)
+  # mv <- mapview(ws)
+  # print(mv)
+  message('enter "x" to mark as "redo", or any other key to see next')
+  input <- readLines(n = 1)
+  if(input == 'x') redo <- c(redo, f)
+}
