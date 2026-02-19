@@ -278,6 +278,15 @@ log_msg('Loaded ', nrow(watersheds), ' watersheds')
 watersheds <- st_transform(watersheds, 4326)
 watersheds <- st_make_valid(watersheds)
 
+# compute bounding box of all watersheds (with small buffer) for cropping rasters
+ws_bbox <- st_bbox(watersheds)
+# add 0.01 degree (~1km) buffer to avoid edge effects
+ws_extent <- ext(ws_bbox['xmin'] - 0.01, ws_bbox['xmax'] + 0.01,
+                 ws_bbox['ymin'] - 0.01, ws_bbox['ymax'] + 0.01)
+log_msg('Watershed extent for raster cropping: ',
+        round(ws_bbox['xmin'], 3), ' to ', round(ws_bbox['xmax'], 3), ' lon, ',
+        round(ws_bbox['ymin'], 3), ' to ', round(ws_bbox['ymax'], 3), ' lat')
+
 
 ## extract land cover fractions ####
 
@@ -302,10 +311,12 @@ log_msg('Processing ', length(all_years), ' years x ',
         nrow(watersheds), ' watersheds')
 
 all_results <- list()
+# all_results <- readRDS('scratch/all_results_through2006.rds')
 t_start <- proc.time()
+# saveRDS(all_results, 'scratch/all_results_through2006.rds')
 
-# for (yr in all_years[-1]) {
-for (yr in all_years) {
+for (yr in all_years[all_years > 2008]) {
+# for (yr in all_years) {
 
   yr_info <- get_year_info(yr)
   if (is.null(yr_info)) next
@@ -314,10 +325,25 @@ for (yr in all_years) {
   yr_tiles <- tile_manifest %>%
     filter(period == yr_info$period)
 
-  # load the correct band from each tile and mosaic
+  # load the correct band from each tile, crop to study area, then mosaic.
+  # Cropping before merge keeps memory usage manageable (~30m tiles are huge).
   rasters <- lapply(yr_tiles$filepath, function(f) {
-    rast(f, lyrs = yr_info$band)
+    r <- rast(f, lyrs = yr_info$band)
+    # only crop if tile overlaps the study extent
+    tile_ext <- ext(r)
+    overlap <- intersect(tile_ext, ws_extent)
+    if (!is.null(overlap)) {
+      crop(r, ws_extent)
+    } else {
+      NULL
+    }
   })
+  rasters <- rasters[!sapply(rasters, is.null)]
+
+  if (length(rasters) == 0) {
+    log_msg('  WARNING: no tiles overlap study area for year ', yr, ' — skipping')
+    next
+  }
 
   if (length(rasters) > 1) {
     yr_rast <- do.call(merge, rasters)
