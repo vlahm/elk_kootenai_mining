@@ -89,7 +89,7 @@ get_trends <- function(d){
     filter(comid %in% top_10) %>% 
     ggplot(aes(x = Year, y = val)) +
     geom_line() +
-    facet_wrap(~comid, scales = 'free')
+    facet_wrap(~comid, scales = 'free_y')
   
   print(p)
   return(trends)
@@ -287,13 +287,17 @@ frame_dir <- file.path(tempdir(), 'glc_frames')
 dir.create(frame_dir, showWarnings = FALSE, recursive = TRUE)
 frame_paths <- character()
 
-# layout: 2 rows
-#   top row:    inset (1) | land cover map (2)
-#   bottom row: Se (3) | SO4 (4) | NO3 (5) | Density (6) | Richness (7)
-lay_mat <- rbind(
-  c(1, 2, 2, 2, 2),
-  c(3, 4, 5, 6, 7)
+# layout: 2 columns
+#   left column:  inset (1) on top, legend (2) below
+#   right column: land cover map (3) on top, Se (4), SO4 (5), NO3 (6) stacked below
+# Use lcm() for left column width to keep it narrow and fixed
+n_ts <- length(ts_list)
+lay_mat <- cbind(
+  c(1, 2, 4:(3 + n_ts)),
+  c(rep(3, 2), 4:(3 + n_ts))
 )
+lay_heights <- c(5, 1, rep(1.2, n_ts - 1), 1.7)
+lay_widths  <- c(1, 1)
 
 for (yr in all_years) {
   lc <- get_lc_year(yr)
@@ -314,32 +318,53 @@ for (yr in all_years) {
   lc_present <- !is.na(lc_pcts) & lc_pcts > 0
 
   fpath <- file.path(frame_dir, sprintf('frame_%04d.png', yr))
-  png(fpath, width = 1600, height = 1200, res = 150)
+  png(fpath, width = 1400, height = 1200, res = 150)
 
-  layout(lay_mat, heights = c(3, 1.5))
+  layout(lay_mat, widths = lay_widths, heights = lay_heights)
 
   # panel 1: basin inset
-  par(mar = c(2, 2, 3, 0.5))
+  par(mar = c(1, 0, 2, 0), oma = c(0, 0, 0, 0))
   plot(st_geometry(basin_outline), col = 'grey90', border = 'grey50',
-       main = 'Location in\nElk-Kootenai Basin', cex.main = 0.9)
+       main = 'Elk-Kootenai\nBasin', cex.main = 0.8)
   plot(st_geometry(poc_shed), col = '#d7191c55', border = '#d7191c',
        lwd = 2, add = TRUE)
 
-  # panel 2: land cover map with percentage legend
-  plot(lc, col = broad_colors[broad_labels], legend = FALSE,
-       main = paste0('GLC Land Cover ', yr,
-                     '  —  Comid ', poc_comid, ' (site ', poc_site, ')'),
-       mar = c(2, 3, 3, 10))
-  legend('right', inset = c(-0.25, 0), xpd = TRUE,
+  # panel 2: legend (below inset)
+  par(mar = c(0, 0, 0, 0), xpd = NA)
+  plot.new()
+  legend('top',
          legend = lc_legend_labels[lc_present],
          fill = broad_colors[broad_labels][lc_present],
-         cex = 0.7, bty = 'n', title = 'Land Cover')
+         cex = 0.65, bty = 'n', title = 'Land Cover',
+         title.cex = 0.75, y.intersp = 1.1)
 
-  # panels 3-7: time-series
-  par(mar = c(3, 4, 2, 1))
-  for (nm in names(ts_list)) {
-    draw_ts_panel(ts_list[[nm]], current_year = yr)
-    title(main = nm, cex.main = 0.9)
+  # panel 3: land cover map
+  # par(mar = c(0, 0, 0, 0), xpd = FALSE, oma = c(0, 0, 0, 0))
+  plot(lc, col = broad_colors[broad_labels], legend = FALSE,
+       main = paste0('GLC Land Cover ', yr,
+                     '  —  Comid ', poc_comid),
+       mar = c(1, 2, 3, 1), oma = c(0, 0, 0, 0))
+  par(xpd = FALSE)
+
+  # panels 4+: stacked time-series with shared x-axis
+  ts_names <- names(ts_list)
+  for (i in seq_along(ts_names)) {
+    nm <- ts_names[i]
+    is_last <- (i == length(ts_names))
+    # bottom margin only on last panel for x-axis labels
+    par(mar = c(ifelse(is_last, 3, 0.5), 4, 0.5, 1))
+    d <- ts_list[[nm]]$data %>% filter(Year <= yr)
+    plot(NA, xlim = ts_xlim, ylim = ts_list[[nm]]$ylim,
+         xlab = ifelse(is_last, 'Year', ''), ylab = ts_list[[nm]]$ylab,
+         xaxt = ifelse(is_last, 's', 'n'),
+         main = '', cex.lab = 0.85, cex.axis = 0.75)
+    if (nrow(d) > 0) {
+      lines(d$Year, d[[ts_list[[nm]]$col]], col = ts_list[[nm]]$color, lwd = 2)
+      points(d$Year, d[[ts_list[[nm]]$col]], col = ts_list[[nm]]$color, pch = 16, cex = 0.6)
+    }
+    abline(v = yr, col = 'grey40', lty = 2)
+    # label on the right margin
+    # mtext(nm, side = 4, line = 0.3, cex = 0.7, las = 0)
   }
 
   layout(1)
