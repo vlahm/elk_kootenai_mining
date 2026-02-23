@@ -16,8 +16,13 @@ chem_no3 <- read_xlsx('data/NitrateF.xlsx') %>%
   filter(! Unit == 'mg N/l******')
 chem_cond <- read_xlsx('data/conductivity.xlsx') %>% 
   rename(MonitoringLocationIdentifier = STATION_NUMBER)
-glc_smry <- read_csv('data/glc_watershed_summary.csv')
-macro <- read_csv('data/macro_snapped0.csv')
+glc_smry <- read_csv('data/glc_watershed_summary.csv') %>% 
+  rename(impervious = urban)
+macro <- read_csv('data/macro_snapped0.csv') %>% 
+  rename(site_id = SiteNumber) %>% 
+  mutate(site_id = if_else(grepl('^[0-9]+$', site_id),
+                           str_pad(site_id, pad = '0', side = 'left', width = 7),
+                           site_id))
 crosswalk <- read_csv('data/watersheds_nhdhr/site_snap_distances.csv') %>% 
   mutate(site_id = if_else(grepl('^[0-9]+$', site_id),
                            str_pad(site_id, pad = '0', side = 'left', width = 7),
@@ -52,7 +57,8 @@ cleanup <- function(d){
     group_by(MonitoringLocationIdentifier) %>% 
     filter(n() >= 10) %>% 
     arrange(Year) %>% 
-    ungroup()
+    ungroup() %>% 
+    left_join(crosswalk, by = c(MonitoringLocationIdentifier = 'site_id'))
 }
 
 chem_no3 <- cleanup(chem_no3)
@@ -60,30 +66,33 @@ chem_so4 <- cleanup(chem_so4)
 chem_se <- cleanup(chem_se)
 chem_cond <- cleanup(chem_cond)
 
-## detect a few watersheds with strong trends ####
+## detect a few watersheds (COMIDs) with strong trends ####
 
 get_trends <- function(d){
   trends <- d %>%
-    group_by(MonitoringLocationIdentifier) %>%
+    group_by(comid, Year) %>%
+    summarize(val = median(val, na.rm = TRUE), .groups = 'drop') %>%
+    group_by(comid) %>%
+    arrange(Year) %>% 
     summarize(
       sen_slope = sens.slope(val)$estimates,
       p_value   = sens.slope(val)$p.value,
       .groups = 'drop'
-    )
+    ) %>% 
+    arrange(desc(sen_slope))
   
   top_10 <- trends %>% 
-    arrange(desc(sen_slope)) %>% 
     slice(1:10) %>% 
-    pull(MonitoringLocationIdentifier)
+    pull(comid)
   
   p <- d %>% 
-    filter(MonitoringLocationIdentifier %in% top_10) %>% 
+    filter(comid %in% top_10) %>% 
     ggplot(aes(x = Year, y = val)) +
     geom_line() +
-    facet_wrap(~MonitoringLocationIdentifier, scales = 'free')
+    facet_wrap(~comid, scales = 'free')
   
   print(p)
-  return(arrange(trends, desc(sen_slope)))
+  return(trends)
 }
 
 trends_se <- get_trends(chem_se)
@@ -92,23 +101,23 @@ trends_so4 <- get_trends(chem_so4)
 trends_cond <- get_trends(chem_cond)
 
 selections <- tibble(
-  Se = c('E295210', '0200201', '0200311'),
-  NO3 = c('0200102', 'E288270', 'E295210'),
-  SO4 = c('0200097', 'E295210', '0200209')
+  Se = c('55001100243742', '55001100286402', '55001100074634'),
+  NO3 = c('55001100244332', '55001100286402', '55001100327683'),
+  SO4 = c('55001100074634', '55001100244332', '55001100117908')
+  # Se = c('E295210', '0200201', '0200311'),
+  # NO3 = c('0200102', 'E288270', 'E295210'),
+  # SO4 = c('0200097', 'E295210', '0200209')
   # cond = c()
 ) %>% 
   pivot_longer(cols = everything(),
                names_to = 'var',
-               values_to = 'site_id') %>% 
+               values_to = 'comid') %>% 
   arrange(var)
 
 
 ## map selected watersheds ####
 
-comids_to_map <- crosswalk %>%
-  filter(site_id %in% selections$site_id) %>% 
-  pull(comid) %>% 
-  unique()
+comids_to_map <- unique(selections$comid)
 
 sheds <- map_dfr(paste0('data/watersheds_nhdhr/sheds_good/comid_', comids_to_map, '.gpkg'), st_read)
 
@@ -144,17 +153,78 @@ broad_colors <- c(
   'barren_snow_ice' = '#bdbdbd'
 )
 
-# --- animated GLC land cover map for one watershed ---
+# --- animated GLC land cover map + time series for one watershed ---
 
 poc_comid <- comids_to_map[1]
 poc_shed  <- sheds %>% filter(comid == poc_comid) %>% st_transform(4326)
 ws_vect   <- vect(poc_shed)
 ws_ext    <- ext(st_bbox(poc_shed)) + 0.01
 
-poc_site <- crosswalk %>%
+# poc_sites <- crosswalk %>%
+#   filter(comid == poc_comid) %>%
+#   pull(site_id)
+
+# --- prepare time-series data for this watershed's site(s) ---
+
+ts_se <- chem_se %>%
   filter(comid == poc_comid) %>%
-  pull(site_id) %>%
-  first()
+  group_by(Year) %>%
+  summarize(val = median(val, na.rm = TRUE), .groups = 'drop') %>%
+  arrange(Year)
+
+ts_so4 <- chem_so4 %>%
+  filter(comid == poc_comid) %>%
+  group_by(Year) %>%
+  summarize(val = median(val, na.rm = TRUE), .groups = 'drop') %>%
+  arrange(Year)
+
+ts_no3 <- chem_no3 %>%
+  filter(comid == poc_comid) %>%
+  group_by(Year) %>%
+  summarize(val = median(val, na.rm = TRUE), .groups = 'drop') %>%
+  arrange(Year)
+
+# ts_macro <- macro %>%
+#   filter(site_id %in% poc_sites) %>%
+#   group_by(Year) %>%
+#   summarize(density  = median(Density_m2, na.rm = TRUE),
+#             richness = median(Richness, na.rm = TRUE),
+#             .groups = 'drop') %>%
+#   arrange(Year)
+
+# global y-axis ranges (so axes stay fixed across frames)
+ts_list <- list(
+  Se       = list(data = ts_se,    col = 'val',      ylab = 'Se (µg/L)',       color = '#e41a1c'),
+  SO4      = list(data = ts_so4,   col = 'val',      ylab = 'SO4 (mg/L)',      color = '#377eb8'),
+  NO3      = list(data = ts_no3,   col = 'val',      ylab = 'NO3 (mg/L)',      color = '#4daf4a')
+  # Density  = list(data = ts_macro, col = 'density',  ylab = 'Density (m⁻²)',   color = '#984ea3'),
+  # Richness = list(data = ts_macro, col = 'richness', ylab = 'Richness',        color = '#ff7f00')
+)
+
+# compute fixed axis limits
+ts_xlim <- range(c(1985, 2022))
+for (nm in names(ts_list)) {
+  vals <- ts_list[[nm]]$data[[ts_list[[nm]]$col]]
+  ts_list[[nm]]$ylim <- if (length(vals) > 0 && any(!is.na(vals))) {
+    range(vals, na.rm = TRUE) * c(0.9, 1.1)
+  } else {
+    c(0, 1)
+  }
+}
+
+# helper to draw a progressive time-series panel
+draw_ts_panel <- function(ts_info, current_year) {
+  d <- ts_info$data %>% filter(Year <= current_year)
+  plot(NA, xlim = ts_xlim, ylim = ts_info$ylim,
+       xlab = '', ylab = ts_info$ylab,
+       main = '', cex.lab = 0.9, cex.axis = 0.8)
+  if (nrow(d) > 0) {
+    lines(d$Year, d[[ts_info$col]], col = ts_info$color, lwd = 2)
+    points(d$Year, d[[ts_info$col]], col = ts_info$color, pch = 16, cex = 0.7)
+  }
+  # vertical line at current year
+  abline(v = current_year, col = 'grey40', lty = 2)
+}
 
 # load Elk-Kootenai basin boundary (for inset)
 basin_outline <- st_read('data/elk_kootenai_basin/KootenaiShape.shp', quiet = TRUE) %>%
@@ -217,28 +287,60 @@ frame_dir <- file.path(tempdir(), 'glc_frames')
 dir.create(frame_dir, showWarnings = FALSE, recursive = TRUE)
 frame_paths <- character()
 
+# layout: 2 rows
+#   top row:    inset (1) | land cover map (2)
+#   bottom row: Se (3) | SO4 (4) | NO3 (5) | Density (6) | Richness (7)
+lay_mat <- rbind(
+  c(1, 2, 2, 2, 2),
+  c(3, 4, 5, 6, 7)
+)
+
 for (yr in all_years) {
   lc <- get_lc_year(yr)
   if (is.null(lc)) next
 
-  fpath <- file.path(frame_dir, sprintf('frame_%04d.png', yr))
-  png(fpath, width = 1200, height = 800, res = 150)
+  # look up land cover percentages from pre-computed summary
+  glc_row <- glc_smry %>% filter(comid == poc_comid, year == yr)
+  if (nrow(glc_row) > 0) {
+    lc_pcts <- as.numeric(glc_row[1, broad_labels]) * 100
+  } else {
+    lc_pcts <- rep(NA_real_, length(broad_labels))
+  }
+  # build legend labels with percentages
+  lc_legend_labels <- ifelse(is.na(lc_pcts),
+                             broad_labels,
+                             paste0(broad_labels, ' (', sprintf('%.1f', lc_pcts), '%)'))
+  # only show classes that are present (> 0%)
+  lc_present <- !is.na(lc_pcts) & lc_pcts > 0
 
-  # inset on left (panel 1), land cover on right (panel 2)
-  layout(matrix(c(1, 2), nrow = 1), widths = c(1.2, 3))
+  fpath <- file.path(frame_dir, sprintf('frame_%04d.png', yr))
+  png(fpath, width = 1600, height = 1200, res = 150)
+
+  layout(lay_mat, heights = c(3, 1.5))
 
   # panel 1: basin inset
-  par(mar = c(3.1, 2, 3.1, 0.5))
+  par(mar = c(2, 2, 3, 0.5))
   plot(st_geometry(basin_outline), col = 'grey90', border = 'grey50',
        main = 'Location in\nElk-Kootenai Basin', cex.main = 0.9)
   plot(st_geometry(poc_shed), col = '#d7191c55', border = '#d7191c',
        lwd = 2, add = TRUE)
 
-  # panel 2: land cover
-  plot(lc, col = broad_colors[broad_labels],
+  # panel 2: land cover map with percentage legend
+  plot(lc, col = broad_colors[broad_labels], legend = FALSE,
        main = paste0('GLC Land Cover ', yr,
-                     '\nComid ', poc_comid, ' (site ', poc_site, ')'),
-       mar = c(3.1, 3.1, 3.1, 8))
+                     '  —  Comid ', poc_comid, ' (site ', poc_site, ')'),
+       mar = c(2, 3, 3, 10))
+  legend('right', inset = c(-0.25, 0), xpd = TRUE,
+         legend = lc_legend_labels[lc_present],
+         fill = broad_colors[broad_labels][lc_present],
+         cex = 0.7, bty = 'n', title = 'Land Cover')
+
+  # panels 3-7: time-series
+  par(mar = c(3, 4, 2, 1))
+  for (nm in names(ts_list)) {
+    draw_ts_panel(ts_list[[nm]], current_year = yr)
+    title(main = nm, cex.main = 0.9)
+  }
 
   layout(1)
   dev.off()
@@ -248,5 +350,6 @@ for (yr in all_years) {
 }
 
 # assemble GIF
+dir.create('figs', showWarnings = FALSE, recursive = TRUE)
 gif_out <- paste0('figs/glc_landcover_comid_', poc_comid, '.gif')
-gifski(frame_paths, gif_file = gif_out, width = 1200, height = 800, delay = 0.5)
+gifski(frame_paths, gif_file = gif_out, width = 1600, height = 1200, delay = 0.5)
