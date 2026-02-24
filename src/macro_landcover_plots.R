@@ -27,6 +27,8 @@ crosswalk <- read_csv('data/watersheds_nhdhr/site_snap_distances.csv') %>%
 macro <- macro %>%
   left_join(filter(crosswalk, source == 'macro'), by = 'site_id')
 
+mines_raw <- st_read('data/skytruth/med_0-10_thresh_ridgeMasked_1985-2024_firstMined.geojson')
+
 # ── orders of interest ────────────────────────────────────────────────────────
 
 focal_orders <- c('Ephemeroptera', 'Plecoptera', 'Diptera',
@@ -48,7 +50,7 @@ macro_year_counts <- macro %>%
   filter(!is.na(comid)) %>%
   group_by(comid) %>%
   summarize(n_macro_years = length(unique(Year)), .groups = 'drop') %>%
-  filter(n_macro_years >= 5)
+  filter(n_macro_years >= 3)
 
 richness_trends <- macro %>%
   filter(!is.na(comid),
@@ -56,7 +58,7 @@ richness_trends <- macro %>%
   group_by(comid, Year) %>%
   summarize(richness = length(unique(na.omit(Genus))), .groups = 'drop') %>%
   group_by(comid) %>%
-  filter(n() >= 5) %>%
+  filter(n() >= 3) %>%
   arrange(Year) %>%
   summarize(
     sen_slope = sens.slope(richness)$estimates,
@@ -74,15 +76,56 @@ richness_trends <- richness_trends %>%
 richness_trends <- richness_trends %>%
   filter(comid %in% glc_smry$comid)
 
-comids_to_map <- richness_trends %>%
-  slice_head(n = 20) %>%
+# ── pre-compute mining % for all viable comids ───────────────────────────────
+
+viable_comids <- richness_trends$comid
+
+message('Computing mining % for ', length(viable_comids), ' viable COMIDs ...')
+
+all_sheds <- map_dfr(paste0('data/watersheds_nhdhr/sheds_good/comid_',
+                            viable_comids, '.gpkg'), st_read) %>%
+  st_transform(4326)
+
+sf_use_s2(FALSE)
+mining_pct <- map_dfr(viable_comids, function(cid) {
+  shed <- all_sheds %>% filter(comid == cid)
+  ws_area_km2 <- as.numeric(st_area(st_union(shed))) / 1e6
+  mines_ws <- tryCatch(
+    st_intersection(mines_raw, shed) %>% st_make_valid(),
+    error = function(e) st_sf(geometry = st_sfc(), crs = 4326)
+  )
+  if (nrow(mines_ws) > 0) {
+    mine_area_km2 <- as.numeric(st_area(st_union(mines_ws))) / 1e6
+  } else {
+    mine_area_km2 <- 0
+  }
+  tibble(comid = cid,
+         ws_area_km2 = ws_area_km2,
+         mine_area_km2 = mine_area_km2,
+         mine_pct = mine_area_km2 / ws_area_km2 * 100)
+})
+sf_use_s2(TRUE)
+
+message('Mining % summary:')
+print(summary(mining_pct$mine_pct))
+
+# keep only comids with some mining influence, then pick top 3 declining richness
+comids_with_mining <- mining_pct %>%
+  filter(mine_pct > 0) %>%
   pull(comid)
 
-message('Selected COMIDs (strongest declining richness): ',
+message(length(comids_with_mining), ' of ', length(viable_comids),
+        ' viable COMIDs have mining influence')
+
+comids_to_map <- richness_trends %>%
+  filter(comid %in% comids_with_mining) %>%
+  slice_head(n = 10) %>%
+  pull(comid)
+
+message('Selected COMIDs (declining richness + mining): ',
         paste(comids_to_map, collapse = ', '))
 
-sheds <- map_dfr(paste0('data/watersheds_nhdhr/sheds_good/comid_',
-                        comids_to_map, '.gpkg'), st_read)
+sheds <- all_sheds %>% filter(comid %in% comids_to_map)
 
 # ── GLC / tile setup ──────────────────────────────────────────────────────────
 
@@ -255,8 +298,8 @@ for (i in seq_along(comids_to_map)) {
   p3 <- ggplot(ts_macro, aes(x = Year, y = density)) +
     geom_line(color = '#984ea3', linewidth = 0.8) +
     geom_point(color = '#984ea3', size = 0.8) +
-    labs(x = NULL, y = expression('Density (m'^-2*')'),
-         title = 'Invertebrate density') +
+    labs(x = NULL, y = 'Count',
+         title = 'Macroinvertebrate density (top 6 orders)') +
     theme_minimal(base_size = 11) +
     theme(axis.text.x = element_blank(),
           plot.title = element_text(face = 'bold', size = 11))
@@ -266,8 +309,8 @@ for (i in seq_along(comids_to_map)) {
   p4 <- ggplot(ts_macro, aes(x = Year, y = richness)) +
     geom_line(color = '#ff7f00', linewidth = 0.8) +
     geom_point(color = '#ff7f00', size = 0.8) +
-    labs(x = 'Year', y = 'Richness',
-         title = 'Genus richness') +
+    labs(x = 'Year', y = 'Count',
+         title = 'Genus richness (unique genera)') +
     theme_minimal(base_size = 11) +
     theme(plot.title = element_text(face = 'bold', size = 11))
 
@@ -283,7 +326,7 @@ for (i in seq_along(comids_to_map)) {
     geom_line(linewidth = 0.8) +
     geom_point(size = 0.8) +
     scale_color_manual(values = order_colors, name = 'Order') +
-    labs(x = NULL, y = expression('Density (m'^-2*')'),
+    labs(x = NULL, y = 'Count',
          title = 'Density by order') +
     theme_minimal(base_size = 11) +
     theme(legend.position = 'none',
@@ -302,7 +345,7 @@ for (i in seq_along(comids_to_map)) {
     geom_line(linewidth = 0.8) +
     geom_point(size = 0.8) +
     scale_color_manual(values = order_colors, name = 'Order') +
-    labs(x = 'Year', y = 'Richness',
+    labs(x = 'Year', y = 'Count',
          title = 'Richness by order') +
     theme_minimal(base_size = 11) +
     theme(legend.position = c(0.85, 0.85),
@@ -373,20 +416,19 @@ for (i in seq_along(comids_to_map)) {
 
   # ── assemble with patchwork ─────────────────────────────────────────────────
 
-  left_col  <- (p1 / p2) + plot_layout(axes = 'collect_x')
-  mid_col   <- (p3 / p4) + plot_layout(axes = 'collect_x')
-  right_mid <- (p5 / p6) + plot_layout(axes = 'collect_x')
-  right_col <- (p_inset / p_legend / p_lc1985 / p_lc2022) +
+  left_col  <- (p1 / p2 / p5)
+  right_col_ts <- (p3 / p4 / p6)
+  sidebar   <- (p_inset / p_legend / p_lc1985 / p_lc2022) +
     plot_layout(heights = c(2, 1.5, 2, 2))
 
-  combined <- (left_col | mid_col | right_mid | right_col) +
-    plot_layout(widths = c(2, 2, 2, 1.2)) +
+  combined <- (left_col | right_col_ts | sidebar) +
+    plot_layout(widths = c(2, 2, 1.2)) +
     plot_annotation(
       title = paste0('Watershed ', poc_comid, ' — Land Cover, Mining & Macroinvertebrates'),
       theme = theme(plot.title = element_text(face = 'bold', size = 14, hjust = 0.5))
     )
 
   out_png <- paste0('figs/macro_lc_comid_', poc_comid, '.png')
-  ggsave(out_png, combined, width = 20, height = 10, dpi = 300)
+  ggsave(out_png, combined, width = 16, height = 10, dpi = 300)
   message('Saved ', out_png)
 }
