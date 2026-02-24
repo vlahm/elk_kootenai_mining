@@ -164,6 +164,35 @@ broad_colors <- c(
 
 # --- animated GLC land cover map + time series for one watershed ---
 
+# tile configuration (same as summarize_glc.R)
+tile_lons <- c('W115', 'W120')
+tile_lats <- c('N50', 'N55')
+glc_dir   <- 'data/glc'
+
+# early files: 4 bands = 1985, 1990, 1995, 2000
+early_years <- c(1985L, 1990L, 1995L, 2000L)
+# late files: 23 bands = 2000:2022
+late_years  <- 2000L:2022L
+
+# all years to animate (use 2000 from late file to avoid duplication)
+all_years <- sort(unique(c(1985L, 1990L, 1995L, late_years)))
+
+# build tile file lookup for both periods
+early_files <- expand_grid(lon = tile_lons, lat = tile_lats) %>%
+  mutate(path = file.path(glc_dir,
+    paste0('GLC_FCS30D_19852000_', lon, lat, '_5years_V1.1.tif'))) %>%
+  filter(file.exists(path)) %>%
+  pull(path)
+
+late_files <- expand_grid(lon = tile_lons, lat = tile_lats) %>%
+  mutate(path = file.path(glc_dir,
+    paste0('GLC_FCS30D_20002022_', lon, lat, '_Annual_V1.1.tif'))) %>%
+  filter(file.exists(path)) %>%
+  pull(path)
+
+# load SkyTruth mining polygons (used for cumulative mining panel)
+mines_raw <- st_read('data/skytruth/med_0-10_thresh_ridgeMasked_1985-2024_firstMined.geojson')
+
 for(i in seq_along(comids_to_map)){
   
   poc_comid <- comids_to_map[i]
@@ -174,6 +203,32 @@ for(i in seq_along(comids_to_map)){
   # poc_sites <- crosswalk %>%
   #   filter(comid == poc_comid) %>%
   #   pull(site_id)
+  
+  # --- compute cumulative mining % for this watershed ---
+  
+  mines_ws <- st_intersection(mines_raw, poc_shed) %>% st_make_valid()
+  ws_area_km2 <- as.numeric(st_area(st_union(poc_shed))) / 1e6
+  
+  if (nrow(mines_ws) > 0) {
+    mine_yrs_ws <- sort(unique(mines_ws$DN))
+    sf_use_s2(FALSE)
+    ts_mining <- tibble(
+      Year = mine_yrs_ws,
+      val  = sapply(mine_yrs_ws, function(y) {
+        cum <- mines_ws %>% filter(DN <= y) %>% st_union() %>% st_make_valid()
+        as.numeric(st_area(cum)) / 1e6 / ws_area_km2 * 100
+      })
+    )
+    sf_use_s2(TRUE)
+    # fill in all_years: carry forward cumulative value, 0 before first mine year
+    ts_mining <- tibble(Year = as.numeric(all_years)) %>%
+      left_join(ts_mining, by = 'Year') %>%
+      arrange(Year) %>%
+      mutate(val = ifelse(Year < min(mine_yrs_ws), 0, val)) %>%
+      tidyr::fill(val, .direction = 'down')
+  } else {
+    ts_mining <- tibble(Year = as.numeric(all_years), val = 0)
+  }
   
   # --- prepare time-series data for this watershed's site(s) ---
   
@@ -208,7 +263,8 @@ for(i in seq_along(comids_to_map)){
   ts_list <- list(
     Se       = list(data = ts_se,    col = 'val',      ylab = 'Se (µg/L)',       color = '#e41a1c'),
     SO4      = list(data = ts_so4,   col = 'val',      ylab = 'SO4 (mg/L)',      color = '#377eb8'),
-    NO3      = list(data = ts_no3,   col = 'val',      ylab = 'NO3 (mg/L)',      color = '#4daf4a')
+    NO3      = list(data = ts_no3,   col = 'val',      ylab = 'NO3 (mg/L)',      color = '#4daf4a'),
+    Mining   = list(data = ts_mining, col = 'val',      ylab = 'Cum. mining (%)', color = '#984ea3')
     # Density  = list(data = ts_macro, col = 'density',  ylab = 'Density (m⁻²)',   color = '#984ea3'),
     # Richness = list(data = ts_macro, col = 'richness', ylab = 'Richness',        color = '#ff7f00')
   )
@@ -242,32 +298,6 @@ for(i in seq_along(comids_to_map)){
   basin_outline <- st_read('data/elk_kootenai_basin/KootenaiShape.shp', quiet = TRUE) %>%
     st_transform(4326) %>%
     st_make_valid()
-  
-  # tile configuration (same as summarize_glc.R)
-  tile_lons <- c('W115', 'W120')
-  tile_lats <- c('N50', 'N55')
-  glc_dir   <- 'data/glc'
-  
-  # early files: 4 bands = 1985, 1990, 1995, 2000
-  early_years <- c(1985L, 1990L, 1995L, 2000L)
-  # late files: 23 bands = 2000:2022
-  late_years  <- 2000L:2022L
-  
-  # all years to animate (use 2000 from late file to avoid duplication)
-  all_years <- sort(unique(c(1985L, 1990L, 1995L, late_years)))
-  
-  # build tile file lookup for both periods
-  early_files <- expand_grid(lon = tile_lons, lat = tile_lats) %>%
-    mutate(path = file.path(glc_dir,
-      paste0('GLC_FCS30D_19852000_', lon, lat, '_5years_V1.1.tif'))) %>%
-    filter(file.exists(path)) %>%
-    pull(path)
-  
-  late_files <- expand_grid(lon = tile_lons, lat = tile_lats) %>%
-    mutate(path = file.path(glc_dir,
-      paste0('GLC_FCS30D_20002022_', lon, lat, '_Annual_V1.1.tif'))) %>%
-    filter(file.exists(path)) %>%
-    pull(path)
   
   # helper: load, crop, mosaic, reclassify, mask for one year
   get_lc_year <- function(yr) {
