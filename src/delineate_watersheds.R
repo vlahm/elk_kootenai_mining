@@ -6,7 +6,7 @@ library(nhdplusTools)
 
 ## logging setup ####
 
-log_file <- 'logs/delineate_watersheds.log'
+log_file <- 'logs/delineate_watersheds_macro.log'
 dir.create(dirname(log_file), recursive = TRUE, showWarnings = FALSE)
 
 # helper: write to log file AND print a short summary to console
@@ -81,6 +81,13 @@ macro <- read_csv('data/macro_snapped0.csv', show_col_types = FALSE) %>%
     source = 'macro'
   ) %>%
   select(site_id, lat, lon, source)
+# more_macro <- read_csv('~/Downloads/EMacroS.csv', show_col_types = FALSE) %>% 
+#   rename(lat = Latitude, lon = Longitude, site_id = SiteNumber) %>% 
+#   mutate(
+#     source = 'macro'
+#   ) %>%
+#   select(site_id, lat, lon, source)
+# more_macro <- anti_join(more_macro, macro)
 
 # chem sites: unique MonitoringLocationIdentifier
 conc <- read_xlsx('data/ChemConLoc.xlsx') %>%
@@ -91,6 +98,7 @@ conc <- read_xlsx('data/ChemConLoc.xlsx') %>%
 
 # combine all sites
 sites <- bind_rows(macro, conc)
+# sites <- more_macro
 
 
 ## filter sites to Elk-Kootenai study area ####
@@ -549,6 +557,11 @@ if (n_suspect > 0) {
     filter(snap_dist_m > snap_threshold_m) %>%
     arrange(desc(snap_dist_m))
   log_df(suspect_sites, label = 'suspect_sites', n = 20)
+} else {
+  suspect_sites <- tibble(site_id = character(),
+                          source = character(),
+                          comid = double(),
+                          snap_dist_m = double())
 }
 
 write_csv(st_drop_geometry(sites_with_comid),
