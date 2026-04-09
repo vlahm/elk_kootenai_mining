@@ -72,15 +72,15 @@ study_huc4s <- c('1701')
 ## load data ####
 
 # macro sites: unique SiteNumber
-macro <- read_csv('data/macro_snapped0.csv', show_col_types = FALSE) %>%
-  distinct(site_id = SiteNumber, .keep_all = TRUE) %>%
-  rename(lat = Latitude, lon = Longitude) %>% 
-  mutate(
-    # lat = coalesce(Snap_Y, Latitude),
-    # lon = coalesce(Snap_X, Longitude),
-    source = 'macro'
-  ) %>%
-  select(site_id, lat, lon, source)
+# macro <- read_csv('data/macro_snapped0.csv', show_col_types = FALSE) %>%
+#   distinct(site_id = SiteNumber, .keep_all = TRUE) %>%
+#   rename(lat = Latitude, lon = Longitude) %>% 
+#   mutate(
+#     # lat = coalesce(Snap_Y, Latitude),
+#     # lon = coalesce(Snap_X, Longitude),
+#     source = 'macro'
+#   ) %>%
+#   select(site_id, lat, lon, source)
 # more_macro <- read_csv('~/Downloads/EMacroS.csv', show_col_types = FALSE) %>% 
 #   rename(lat = Latitude, lon = Longitude, site_id = SiteNumber) %>% 
 #   mutate(
@@ -88,17 +88,23 @@ macro <- read_csv('data/macro_snapped0.csv', show_col_types = FALSE) %>%
 #   ) %>%
 #   select(site_id, lat, lon, source)
 # more_macro <- anti_join(more_macro, macro)
-
-# chem sites: unique MonitoringLocationIdentifier
-conc <- read_xlsx('data/ChemConLoc.xlsx') %>%
-  distinct(site_id = MonitoringLocationIdentifier, .keep_all = TRUE) %>%
-  rename(lat = LatitudeMeasure, lon = LongitudeMeasure) %>% 
-  mutate(source = 'chem') %>%
+reamp <- read_csv('data/2020 to 2022 RAEMP BIC and WQ(UTMs).csv', show_col_types = FALSE) %>%
+  distinct(Station, .keep_all = TRUE) %>%
+  rename(lat = latitude, lon = longitude, site_id = Station) %>%
+  mutate(source = 'REAMP') %>%
   select(site_id, lat, lon, source)
 
+# chem sites: unique MonitoringLocationIdentifier
+# conc <- read_xlsx('data/ChemConLoc.xlsx') %>%
+#   distinct(site_id = MonitoringLocationIdentifier, .keep_all = TRUE) %>%
+#   rename(lat = LatitudeMeasure, lon = LongitudeMeasure) %>% 
+#   mutate(source = 'chem') %>%
+#   select(site_id, lat, lon, source)
+
 # combine all sites
-sites <- bind_rows(macro, conc)
+# sites <- bind_rows(macro, conc)
 # sites <- more_macro
+sites <- reamp
 
 
 ## filter sites to Elk-Kootenai study area ####
@@ -160,6 +166,7 @@ hr_gpkg <- file.path(hr_dir, 'nhdplushr_merged.gpkg')
 if (file.exists(hr_gpkg)) {
   log_msg('Reading cached NHDPlus HR flowlines from ', hr_gpkg)
   flines <- st_read(hr_gpkg, layer = 'NHDFlowline', quiet = TRUE)
+  flines <- st_transform(flines, 4326)
   if (nrow(flines) == 0) {
     log_msg('Cached file has 0 flowlines — deleting and re-downloading')
     file.remove(hr_gpkg)
@@ -472,7 +479,9 @@ if (length(missing_cols) > 0) {
 
 # --- snap sites to HR flowlines using get_flowline_index ---
 
-fi_cache <- 'data/flowline_indices.rds'
+fi_cache <- paste0('data/flowline_indices_',
+                   paste(sort(unique(sites$source)), collapse = '_'),
+                   '.rds')
 
 if (file.exists(fi_cache)) {
   log_msg('Loading cached flowline indices from ', fi_cache)
@@ -829,7 +838,6 @@ log_msg('Full log written to: ', log_file)
 
 
 ## delineate all unique reaches ####
-## (uncomment the block below to run the full loop)
 
 # read previous outcomes to identify failures that should be retried
 prev_outcomes_file <- file.path(ws_dir, 'delineation_outcomes.csv')
