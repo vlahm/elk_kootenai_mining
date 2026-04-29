@@ -3,6 +3,7 @@ library(sf)
 library(mapview)
 library(readxl)
 library(nhdplusTools)
+library(ggspatial)
 
 ## logging setup ####
 
@@ -57,6 +58,40 @@ remove_holes <- function(x) {
   return(x)
 }
 
+## helper: normalise column names to canonical case ####
+
+# NHDPlus HR GDBs from different dates/VPUs sometimes use lowercase column
+# names (e.g. nhdplusid instead of NHDPlusID).  This helper renames columns
+# to their canonical (mixed-case) form so downstream code can use a single
+# set of names.
+canonical_nhd_names <- c(
+  'NHDPlusID', 'COMID', 'REACHCODE', 'ReachCode',
+  'ToMeas', 'FromMeas',
+  'HydroSeq', 'DnHydroSeq', 'UpHydroSeq',
+  'LevelPathI', 'StartFlag',
+  'StreamOrde', 'StreamCalc',
+  'TotDASqKm', 'DivDASqKm',
+  'FTYPE', 'FCODE', 'GNIS_ID', 'GNIS_NAME',
+  'LENGTHKM', 'Shape_Length', 'Shape_Area',
+  'VPUID', 'Permanent_Identifier'
+)
+
+normalise_nhd_columns <- function(df) {
+  df_names <- names(df)
+  df_names_lower <- tolower(df_names)
+  for (canon in canonical_nhd_names) {
+    # already present with exact name — skip
+    if (canon %in% df_names) next
+    # case-insensitive match
+    idx <- match(tolower(canon), df_names_lower)
+    if (!is.na(idx)) {
+      df_names[idx] <- canon
+    }
+  }
+  names(df) <- df_names
+  df
+}
+
 ## setup ####
 
 ws_dir <- 'data/watersheds_nhdhr'
@@ -66,8 +101,8 @@ dir.create(hr_dir, recursive = TRUE, showWarnings = FALSE)
 
 # HUC4s covering the Elk-Kootenai study area
 # Add more HUC4s here if sites fall outside these
-study_huc4s <- c('0104', '0107', '0108')
-study_huc4s <- c('1701')
+study_huc4s <- c('0104', '0106', '0107', '0108')
+# study_huc4s <- c('1701')
 
 
 ## load data ####
@@ -91,6 +126,8 @@ study_huc4s <- c('1701')
 # more_macro <- anti_join(more_macro, macro)
 hbef <- read_csv('data/unrelated_hbef_sites.csv', show_col_types = FALSE) %>%
   rename(lat = Latitude, lon = Longitude, site_id = ID) %>%
+  mutate(site_id = if_else(site_id == 'Mill Brook' & Accessible == 'Y', paste(site_id, 'roadside'), site_id)) %>% 
+  mutate(site_id = if_else(site_id == 'Wild Ammonoosuc River' & Accessible == 'Y', paste(site_id, 'roadside'), site_id)) %>% 
   mutate(source = 'hbef') %>%
   select(site_id, lat, lon, source) %>% 
   drop_na(lat, lon)
@@ -124,20 +161,56 @@ sites_sf <- st_as_sf(sites, coords = c('lon', 'lat'), crs = 4326)
 huc4_boundary_file <- file.path(hr_dir, 'huc4_boundary.gpkg')
 if (file.exists(huc4_boundary_file)) {
   huc4_boundary <- st_read(huc4_boundary_file, quiet = TRUE)
-} else {
-  # find the GDB to read WBDHU4 from
-  gdb_path <- list.dirs(hr_dir, full.names = TRUE, recursive = TRUE)
-  gdb_path <- gdb_path[grepl('\\.gdb$', gdb_path)][1]
-  if (!is.na(gdb_path) && 'WBDHU4' %in% st_layers(gdb_path)$name) {
-    huc4_boundary <- st_read(gdb_path, layer = 'WBDHU4', quiet = TRUE)
+  # verify cached boundary covers the current study_huc4s
+  if ('HUC4' %in% names(huc4_boundary)) {
+    cached_hucs <- unique(huc4_boundary$HUC4)
+    if (!all(study_huc4s %in% cached_hucs)) {
+      log_msg('Cached HUC4 boundary does not cover all study_huc4s — rebuilding')
+      file.remove(huc4_boundary_file)
+    }
+  }
+}
+
+if (!file.exists(huc4_boundary_file)) {
+  # find GDBs under hr_dir whose names match one of the study HUC4s
+  all_gdbs <- list.dirs(hr_dir, full.names = TRUE, recursive = TRUE)
+  all_gdbs <- all_gdbs[grepl('\\.gdb$', all_gdbs)]
+  # keep only GDBs whose basename contains a study HUC4 code
+  huc4_pattern <- paste0('NHDPLUS_H_(', paste(study_huc4s, collapse = '|'), ')_')
+  all_gdbs <- all_gdbs[grepl(huc4_pattern, basename(all_gdbs))]
+  log_msg('Found ', length(all_gdbs), ' matching GDBs under ', hr_dir)
+
+  huc4_parts <- list()
+  for (gdb_path in all_gdbs) {
+    if ('WBDHU4' %in% st_layers(gdb_path)$name) {
+      h4 <- st_read(gdb_path, layer = 'WBDHU4', quiet = TRUE)
+      # find the HUC4 column (may be HUC4 or huc4)
+      huc4_col <- grep('^HUC4$', names(h4), ignore.case = TRUE, value = TRUE)
+      if (length(huc4_col) > 0) {
+        h4 <- h4 %>% filter(.data[[huc4_col[1]]] %in% study_huc4s)
+        # keep only HUC4 + geometry to avoid schema mismatches across GDBs
+        h4 <- h4 %>%
+          mutate(HUC4 = .data[[huc4_col[1]]]) %>%
+          select(HUC4)
+      }
+      if (nrow(h4) > 0) {
+        huc4_parts <- c(huc4_parts, list(h4))
+        log_msg('  Read ', nrow(h4), ' HUC4 boundaries from ', basename(gdb_path))
+      }
+    }
+  }
+
+  if (length(huc4_parts) > 0) {
+    huc4_boundary <- bind_rows(huc4_parts) %>%
+      distinct(HUC4, .keep_all = TRUE)
+    log_msg('HUC4 boundary covers: ',
+            paste(unique(huc4_boundary$HUC4), collapse = ', '))
     st_write(huc4_boundary, huc4_boundary_file, quiet = TRUE)
   } else {
-    # fallback: use a bounding box for HUC 1701 (approximate)
-    log_msg('WARNING: WBDHU4 layer not found — using approximate bbox for 1701')
+    log_msg('WARNING: WBDHU4 layer not found in any matching GDB — ',
+            'using convex hull of site locations as fallback')
     huc4_boundary <- st_as_sf(
-      st_as_sfc(st_bbox(c(xmin = -117.5, ymin = 46.5,
-                           xmax = -114.0, ymax = 49.5),
-                         crs = 4326))
+      st_buffer(st_convex_hull(st_union(sites_sf)), 0.1)
     )
   }
 }
@@ -173,7 +246,8 @@ hr_gpkg <- file.path(hr_dir, 'nhdplushr_merged.gpkg')
 
 if (file.exists(hr_gpkg)) {
   log_msg('Reading cached NHDPlus HR flowlines from ', hr_gpkg)
-  flines <- st_read(hr_gpkg, layer = 'NHDFlowline', quiet = TRUE)
+  flines <- st_read(hr_gpkg, layer = 'NHDFlowline', quiet = TRUE) %>%
+    normalise_nhd_columns()
   flines <- st_transform(flines, 4326)
   if (nrow(flines) == 0) {
     log_msg('Cached file has 0 flowlines — deleting and re-downloading')
@@ -335,7 +409,7 @@ if (!file.exists(hr_gpkg)) {
   flines_list <- lapply(hr_files, function(f) {
     st_read(f, layer = fl_layer, quiet = TRUE)
   })
-  flines <- bind_rows(flines_list)
+  flines <- bind_rows(flines_list) %>% normalise_nhd_columns()
   log_msg('Total HR flowlines: ', nrow(flines))
 
   # read the NHDPlusFlowlineVAA table and join ToMeas/FromMeas
@@ -344,7 +418,7 @@ if (!file.exists(hr_gpkg)) {
   vaa_list <- lapply(hr_files, function(f) {
     st_read(f, layer = 'NHDPlusFlowlineVAA', quiet = TRUE)
   })
-  vaa <- bind_rows(vaa_list)
+  vaa <- bind_rows(vaa_list) %>% normalise_nhd_columns()
   log_msg('VAA rows: ', nrow(vaa))
 
   # column names to log file only (too long for console)
@@ -361,22 +435,14 @@ if (!file.exists(hr_gpkg)) {
                    'UpHydroSeq', 'LevelPathI', 'StartFlag',
                    'StreamOrde', 'StreamCalc',
                    'TotDASqKm', 'DivDASqKm')
+
   vaa_cols <- intersect(names(vaa), wanted_vaa)
   missing_vaa <- setdiff(wanted_vaa, names(vaa))
   if (length(missing_vaa) > 0) {
-    log_msg('WARNING: VAA missing expected columns: ',
+    log_msg('WARNING: VAA still missing columns after normalisation: ',
             paste(missing_vaa, collapse = ', '))
-    # check for alternate names (NHDPlus HR sometimes uses different cases)
-    vaa_lower <- setNames(names(vaa), tolower(names(vaa)))
-    for (mc in missing_vaa) {
-      alt <- vaa_lower[tolower(mc)]
-      if (!is.na(alt)) {
-        log_msg('  Found alternate: ', alt, ' for ', mc)
-        vaa_cols <- c(vaa_cols, alt)
-      }
-    }
   }
-  vaa_cols <- unique(vaa_cols)
+
   # drop VAA columns that already exist on flines (except the join key)
   existing_fline_cols <- setdiff(names(flines), 'NHDPlusID')
   vaa_cols_to_join <- setdiff(vaa_cols, existing_fline_cols)
@@ -455,7 +521,7 @@ if (!file.exists(hr_gpkg)) {
   catch_list <- lapply(hr_files, function(f) {
     st_read(f, layer = catch_layer, quiet = TRUE)
   })
-  catchments <- bind_rows(catch_list)
+  catchments <- bind_rows(catch_list) %>% normalise_nhd_columns()
   log_msg('Total HR catchments: ', nrow(catchments))
 
   if (nrow(catchments) == 0) {
@@ -604,7 +670,8 @@ log_msg(length(unique_comids), ' unique COMIDs to delineate')
 
 if (!exists('catchments')) {
   log_msg('Reading HR catchments from ', hr_gpkg)
-  catchments <- st_read(hr_gpkg, layer = 'NHDPlusCatchment', quiet = TRUE)
+  catchments <- st_read(hr_gpkg, layer = 'NHDPlusCatchment', quiet = TRUE) %>%
+    normalise_nhd_columns()
 }
 log_msg('Loaded ', nrow(catchments), ' HR catchments')
 
@@ -661,8 +728,8 @@ fl_net <- flines %>%
   select(COMID,
          any_of(c('HydroSeq', 'Hydroseq', 'HydroSeq.x',
                    'DnHydroSeq', 'DnHydroseq', 'DnHydroSeq.x'))) %>%
-  rename_with(~ 'HydroSeq',   .cols = any_of(c('Hydroseq', 'HydroSeq.x'))) %>%
-  rename_with(~ 'DnHydroSeq', .cols = any_of(c('DnHydroseq', 'DnHydroSeq.x'))) %>%
+  rename_with(~ 'HydroSeq',   .cols = any_of(c('Hydroseq', 'HydroSeq.x', 'HydroSeq'))) %>%
+  rename_with(~ 'DnHydroSeq', .cols = any_of(c('DnHydroseq', 'DnHydroSeq.x', 'DnHydroSeq'))) %>%
   filter(!is.na(HydroSeq), !is.na(DnHydroSeq))
 
 # COMID → HydroSeq lookup (named vector, character keys for env lookup)
@@ -969,17 +1036,100 @@ message('Done. ', sum(outcomes$status == 'success'), ' succeeded, ',
 ## verify (optional) ####
 
 dir.create('ws_png', showWarnings = FALSE)
-sheds <- list.files(ws_dir, pattern = '*.gpkg', full.names = TRUE)
-# lame <- c()
-for(f in sheds[1:10]){
-  ws <- st_read(f, quiet = TRUE)
-  if(!st_is_longlat(ws)) ws <- st_transform(ws, 4326)
-  pngfile <- file.path('ws_png', paste0(basename(f), '.png'))
-  png(pngfile, width = 900, height = 900)
-  tryres <- try(plot(st_geometry(ws), main = basename(f)), silent = TRUE)
-  dev.off()
-  # if(inherits(tryres, 'try-error')) lame <- c(lame, f)
+sheds <- list.files(ws_dir, pattern = 'comid_.*\\.gpkg$', full.names = TRUE)
+
+# read site-COMID crosswalk and build an sf object of site locations
+crosswalk_file <- file.path(ws_dir, 'site_comid_lookup.csv')
+if (file.exists(crosswalk_file)) {
+  site_xwalk <- read_csv(crosswalk_file, show_col_types = FALSE)
+  # join back to sites table (which has lat/lon) to get coordinates
+  site_pts <- sites %>%
+    inner_join(site_xwalk, by = c('site_id', 'source', 'comid')) %>%
+    st_as_sf(coords = c('lon', 'lat'), crs = 4326)
+  log_msg('Loaded ', nrow(site_pts), ' site locations for verification plots')
+} else {
+  log_msg('WARNING: ', crosswalk_file, ' not found — plots will omit site points')
+  site_pts <- NULL
 }
+
+# prepare HR flowlines for clipping into each watershed plot
+# flines should already be in memory from earlier; ensure 4326
+# cast to LINESTRING so st_crop doesn't choke on mixed geometry types
+if (exists('flines') && nrow(flines) > 0) {
+  flines_4326 <- flines %>%
+    st_transform(4326) %>%
+    st_zm(drop = TRUE, what = 'ZM') %>%
+    st_cast('MULTILINESTRING') %>%
+    st_make_valid()
+  log_msg('Prepared ', nrow(flines_4326), ' HR flowlines for verify plots')
+} else {
+  flines_4326 <- NULL
+  log_msg('WARNING: flines not in memory — verify plots will omit streamlines')
+}
+
+log_msg('Generating ', length(sheds), ' verification PNGs...')
+
+for (f in sheds) {
+  ws <- st_read(f, quiet = TRUE)
+  if (!st_is_longlat(ws)) ws <- st_transform(ws, 4326)
+
+  # extract COMID from filename to find associated sites
+  ws_comid <- str_extract(basename(f), 'comid_([0-9]+)', group = 1)
+
+  # clip flowlines to watershed bbox using st_crop (much faster than
+  # st_intersection — leverages the spatial index for bbox filtering)
+  ws_flines <- NULL
+  if (!is.null(flines_4326)) {
+    ws_bbox <- st_bbox(ws)
+    ws_bbox[c('xmin', 'ymin')] <- ws_bbox[c('xmin', 'ymin')] - 0.005
+    ws_bbox[c('xmax', 'ymax')] <- ws_bbox[c('xmax', 'ymax')] + 0.005
+    crop_box <- st_as_sfc(ws_bbox) %>% st_transform(crs = 4326)
+    ws_flines <- tryCatch(
+      suppressWarnings(st_crop(flines_4326, crop_box)),
+      error = function(e) NULL
+    )
+  }
+
+  # find associated sites
+  ws_sites <- NULL
+  if (!is.null(site_pts) && !is.na(ws_comid)) {
+    ws_sites <- site_pts %>% filter(as.character(comid) == ws_comid)
+  }
+
+  # build ggplot
+  p <- ggplot() +
+    geom_sf(data = ws, fill = 'lightyellow', colour = 'black', linewidth = 0.6)
+
+  if (!is.null(ws_flines) && nrow(ws_flines) > 0) {
+    p <- p + geom_sf(data = ws_flines, colour = 'steelblue',
+                     linewidth = 0.3, alpha = 0.7)
+  }
+
+  if (!is.null(ws_sites) && nrow(ws_sites) > 0) {
+    p <- p + geom_sf(data = ws_sites, colour = 'red', size = 3, shape = 16)
+  }
+
+  p <- p +
+    annotation_scale(location = 'bl', width_hint = 0.3,
+                     style = 'ticks', text_cex = 0.8) +
+    labs(title = paste0('COMID ', ws_comid),
+         subtitle = paste(ws_sites$site_id, collapse = '; ')) +
+    theme_minimal() +
+    theme(plot.title = element_text(face = 'bold', size = 14),
+          plot.subtitle = element_text(size = 9, colour = 'grey40'),
+          axis.text = element_text(size = 7))
+
+  pngfile <- file.path('ws_png', paste0(basename(f), '.png'))
+  tryCatch(
+    ggsave(pngfile, plot = p, width = 9, height = 9, dpi = 100),
+    error = function(e) {
+      log_msg('  WARNING: plot failed for ', basename(f), ': ',
+              conditionMessage(e))
+    }
+  )
+}
+
+log_msg('Verification PNGs written to ws_png/')
 
 # for(f in lame){
 #   file.remove(f)
