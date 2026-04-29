@@ -66,6 +66,7 @@ dir.create(hr_dir, recursive = TRUE, showWarnings = FALSE)
 
 # HUC4s covering the Elk-Kootenai study area
 # Add more HUC4s here if sites fall outside these
+study_huc4s <- c('0104', '0107', '0108')
 study_huc4s <- c('1701')
 
 
@@ -88,11 +89,16 @@ study_huc4s <- c('1701')
 #   ) %>%
 #   select(site_id, lat, lon, source)
 # more_macro <- anti_join(more_macro, macro)
-reamp <- read_csv('data/2020 to 2022 RAEMP BIC and WQ(UTMs).csv', show_col_types = FALSE) %>%
-  distinct(Station, .keep_all = TRUE) %>%
-  rename(lat = latitude, lon = longitude, site_id = Station) %>%
-  mutate(source = 'REAMP') %>%
-  select(site_id, lat, lon, source)
+hbef <- read_csv('data/unrelated_hbef_sites.csv', show_col_types = FALSE) %>%
+  rename(lat = Latitude, lon = Longitude, site_id = ID) %>%
+  mutate(source = 'hbef') %>%
+  select(site_id, lat, lon, source) %>% 
+  drop_na(lat, lon)
+# reamp <- read_csv('data/2020 to 2022 RAEMP BIC and WQ(UTMs).csv', show_col_types = FALSE) %>%
+#   distinct(Station, .keep_all = TRUE) %>%
+#   rename(lat = latitude, lon = longitude, site_id = Station) %>%
+#   mutate(source = 'REAMP') %>%
+#   select(site_id, lat, lon, source)
 
 # chem sites: unique MonitoringLocationIdentifier
 # conc <- read_xlsx('data/ChemConLoc.xlsx') %>%
@@ -104,7 +110,8 @@ reamp <- read_csv('data/2020 to 2022 RAEMP BIC and WQ(UTMs).csv', show_col_types
 # combine all sites
 # sites <- bind_rows(macro, conc)
 # sites <- more_macro
-sites <- reamp
+sites <- hbef
+# sites <- reamp
 
 
 ## filter sites to Elk-Kootenai study area ####
@@ -113,6 +120,7 @@ sites_sf <- st_as_sf(sites, coords = c('lon', 'lat'), crs = 4326)
 
 # use HUC4 boundary to keep only sites within the study basin
 # try cached boundary first, then read from GDB
+## download new VPUs from https://prd-tnm.s3.amazonaws.com/index.html?prefix=StagedProducts/Hydrography/NHDPlusHR/VPU/Current/GDB/
 huc4_boundary_file <- file.path(hr_dir, 'huc4_boundary.gpkg')
 if (file.exists(huc4_boundary_file)) {
   huc4_boundary <- st_read(huc4_boundary_file, quiet = TRUE)
