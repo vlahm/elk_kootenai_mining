@@ -5,121 +5,83 @@ library(lubridate)
 library(ggplot2)
 library(terra)
 library(patchwork)
-library(trend)
 
-# ── load data ──────────────────────────────────────────────────────────────────
+options(scipen = 999)   # keep 14-digit comids out of scientific notation
+sf_use_s2(FALSE)        # planar geometry ops (areas computed in projected CRS below)
 
-chem_se  <- read_xlsx('data/SeF.xlsx')
-chem_so4 <- read_xlsx('data/SulfateF.xlsx')
-chem_no3 <- read_xlsx('data/NitrateF.xlsx') %>%
-  filter(!Unit == 'mg N/l******')
-chem_cond <- read_xlsx('data/conductivity.xlsx') %>%
-  rename(MonitoringLocationIdentifier = STATION_NUMBER)
+# Aggregation mode for the chem & macro panels (land cover / mining are always
+# watershed-scale). 'containment' = all monitoring sites inside the shed;
+# 'hybrid' = chem from the reach-snapped site(s) + macro from the nearest macro
+# site to that reach (site-scale, like the original figure). Set via env var:
+#   KS_MODE=hybrid Rscript src/kitchen_sink_plots.R
+AGG_MODE   <- Sys.getenv('KS_MODE', 'containment')
+out_suffix <- if (AGG_MODE == 'hybrid') '_hybrid' else ''
+message('Aggregation mode: ', AGG_MODE)
 
-glc_smry <- read_csv('data/glc_watershed_summary.csv') %>%
-  rename(impervious = urban)
+# ── load data (harmonized inputs) ────────────────────────────────────────────
+# Rebuilt to source from the official harmonized files instead of the legacy
+# per-analyte pulls:
+#   chemistry  -> data/harmonized/ElkChem.xlsx  (carries comid directly)
+#   macro      -> data/harmonized/ElkMacro.xlsx (RAEMP) + data/for_reals/MacroC.xlsx (non-RAEMP)
+#   mining     -> SkyTruth med_0-7 (Pericak-standard threshold used by the report)
+#   watersheds -> data/watersheds_nhdhr/chem_macro_set1/sheds_good (Elk-Kootenai only)
+# QA carried over from misc_analyses.R: ElkChem de-duplicated, Se >1000 ug/L dropped.
 
-macro <- read_csv('data/macro_snapped0.csv') %>%
-  rename(site_id = SiteNumber) %>%
-  mutate(site_id = if_else(grepl('^[0-9]+$', site_id),
-                           str_pad(site_id, pad = '0', side = 'left', width = 7),
-                           site_id)) %>%
-  select(site_id:Count)
+std_cmp <- function(x) case_when(
+  x == 'Selenium' ~ 'Selenium', x == 'Sulfate' ~ 'Sulfate',
+  x %in% c('Nitrate', 'NitrateNO3') ~ 'Nitrate',
+  x %in% c('Specific conductance', 'Specific Conductivity') ~ 'Conductivity',
+  TRUE ~ NA_character_)
 
-crosswalk <- read_csv('data/watersheds_nhdhr/site_snap_distances.csv') %>%
-  mutate(site_id = if_else(grepl('^[0-9]+$', site_id),
-                           str_pad(site_id, pad = '0', side = 'left', width = 7),
-                           site_id))
+# Chemistry (ElkChem) and macro (ElkMacro RAEMP + MacroC non-RAEMP) are kept at
+# the SITE level with coordinates. Each watershed's panels aggregate the sites
+# that fall INSIDE its delineated shed (spatial containment). This is robust to
+# the fact that ElkChem's `comid` key does not match the watershed comids and
+# the original site->comid crosswalk (site_snap_distances.csv) no longer exists.
+elkchem <- suppressWarnings(read_xlsx('data/harmonized/ElkChem.xlsx')) %>%
+  distinct() %>%
+  mutate(analyte = std_cmp(Compound)) %>%
+  filter(!is.na(analyte), !(analyte == 'Selenium' & Value > 1000),
+         !is.na(longitude), !is.na(latitude)) %>%
+  transmute(site_id = STATION_NUMBER, lon = longitude, lat = latitude,
+            analyte, Value, Year = year)
 
-# ── NO3 unit harmonisation (same as landcover_gifs.R) ─────────────────────────
+macro_raemp <- suppressWarnings(read_xlsx('data/harmonized/ElkMacro.xlsx')) %>%
+  filter(SAMPLING_AGENCY == 'RAEMP') %>%
+  transmute(site_id = STATION_NUMBER, lon = LongitudeMeasure, lat = LatitudeMeasure,
+            sample_date = as_date(date), Year = as.integer(year),
+            Genus = na_if(as.character(Unit), '-'), Count = Value)
+macro_pub <- suppressWarnings(read_xlsx('data/for_reals/MacroC.xlsx')) %>%
+  transmute(site_id = STATION_NUMBER, lon = LongitudeMeasure, lat = LatitudeMeasure,
+            sample_date = as_date(SampleDate), Year = year(as_date(SampleDate)),
+            Genus = na_if(as.character(Unit), '-'), Count = Value)
+macro <- bind_rows(macro_raemp, macro_pub) %>% filter(!is.na(lon), !is.na(lat))
 
-no3_smry <- chem_no3 %>%
-  group_by(SAMPLING_AGENCY, Unit, CharacteristicName) %>%
-  summarize(med = median(Value, na.rm = TRUE),
-            max = max(Value, na.rm = TRUE),
-            count = n(), .groups = 'drop')
+# site points for spatial containment (built once)
+chem_pts  <- elkchem %>% distinct(site_id, lon, lat) %>%
+  st_as_sf(coords = c('lon', 'lat'), crs = 4326)
+macro_pts <- macro %>% distinct(site_id, lon, lat) %>%
+  st_as_sf(coords = c('lon', 'lat'), crs = 4326)
 
-chem_no3 <- chem_no3 %>%
-  left_join(no3_smry, by = c('SAMPLING_AGENCY', 'Unit', 'CharacteristicName')) %>%
-  mutate(Value = if_else(Unit == 'mg/l as N' | med < 0.2 | max < 30,
-                         Value * 4.426, Value)) %>%
-  select(-Unit, -CharacteristicName)
+# (land cover is computed per-watershed from the GLC rasters in the loop below,
+#  so the 110-comid glc_watershed_summary.csv intermediary is no longer needed)
 
-# ── cleanup helper ─────────────────────────────────────────────────────────────
+# ── watersheds to render ──────────────────────────────────────────────────────
+# The two watersheds behind the existing all_trends figures, rebuilt directly on
+# the harmonized inputs for a like-for-like comparison. (To re-run the automatic
+# "strongest declining richness" selection instead, restore that block and point
+# it at chem_macro_set1/sheds_good.)
+comids_to_map <- c(55001100327683, 55001100073395)
+if (AGG_MODE == 'hybrid') comids_to_map <- 55001100327683   # the important figure only
+message('Rebuilding COMIDs: ', paste(comids_to_map, collapse = ', '))
 
-cleanup <- function(d) {
-  d %>%
-    group_by(MonitoringLocationIdentifier, Year) %>%
-    summarize(val = median(Value, na.rm = TRUE), .groups = 'drop') %>%
-    mutate(Year = as.numeric(Year)) %>%
-    group_by(MonitoringLocationIdentifier) %>%
-    filter(n() >= 10) %>%
-    arrange(Year) %>%
-    ungroup() %>%
-    left_join(filter(crosswalk, source == 'chem'),
-              by = c(MonitoringLocationIdentifier = 'site_id'))
-}
-
-chem_no3  <- cleanup(chem_no3)
-chem_so4  <- cleanup(chem_so4)
-chem_se   <- cleanup(chem_se)
-chem_cond <- cleanup(chem_cond)
-
-macro <- macro %>%
-  left_join(filter(crosswalk, source == 'macro'), by = 'site_id')
-
-# ── find 3 watersheds with strongest declining genus richness trends ──────────
-
-# comids with at least 5 years of macro data
-macro_year_counts <- macro %>%
-  filter(!is.na(comid)) %>%
-  group_by(comid) %>%
-  summarize(n_macro_years = length(unique(Year)), .groups = 'drop') %>%
-  filter(n_macro_years >= 5)
-
-# comids with chemistry data (at least one of Se, SO4, NO3)
-chem_comids <- unique(c(chem_se$comid, chem_so4$comid, chem_no3$comid))
-chem_comids <- chem_comids[!is.na(chem_comids)]
-
-richness_trends <- macro %>%
-  filter(!is.na(comid),
-         comid %in% macro_year_counts$comid,
-         comid %in% chem_comids) %>%
-  group_by(comid, Year) %>%
-  summarize(richness = length(unique(na.omit(Genus))), .groups = 'drop') %>%
-  group_by(comid) %>%
-  filter(n() >= 5) %>%
-  arrange(Year) %>%
-  summarize(
-    sen_slope = sens.slope(richness)$estimates,
-    p_value   = sens.slope(richness)$p.value,
-    n_years   = n(),
-    .groups   = 'drop'
-  ) %>%
-  arrange(sen_slope)
-
-# keep only comids that have a watershed file on disk
-richness_trends <- richness_trends %>%
-  filter(file.exists(paste0('data/watersheds_nhdhr/sheds_good/comid_', comid, '.gpkg')))
-
-# also require GLC summary data
-richness_trends <- richness_trends %>%
-  filter(comid %in% glc_smry$comid)
-
-comids_to_map <- richness_trends %>%
-  slice_head(n = 3) %>%
-  pull(comid)
-
-message('Selected COMIDs (strongest declining richness): ',
-        paste(comids_to_map, collapse = ', '))
-
-sheds <- map_dfr(paste0('data/watersheds_nhdhr/sheds_good/comid_',
+sheds <- map_dfr(paste0('data/watersheds_nhdhr/chem_macro_set1/sheds_good/comid_',
                         comids_to_map, '.gpkg'), st_read)
 
 # ── GLC / tile setup ──────────────────────────────────────────────────────────
 
 tile_lons <- c('W115', 'W120')
-tile_lats <- c('N50', 'N55')
+tile_lats <- c('N45', 'N50', 'N55')   # tiles overlapping the Elk-Kootenai watersheds
 glc_dir   <- 'data/glc'
 
 early_years <- c(1985L, 1990L, 1995L, 2000L)
@@ -167,7 +129,8 @@ broad_colors <- c(
 
 # ── SkyTruth mines ─────────────────────────────────────────────────────────────
 
-mines_raw <- st_read('data/skytruth/med_0-10_thresh_ridgeMasked_1985-2024_firstMined.geojson')
+mines_raw <- st_read('data/skytruth/mining_extent_firstMined_1984_2025_med0-7.geojson') %>%
+  st_transform(3005) %>% st_make_valid()   # BC Albers -> planar area in km^2, no lwgeom needed
 
 # ── basin outline (for inset) ─────────────────────────────────────────────────
 
@@ -199,6 +162,20 @@ get_lc_year <- function(yr, ws_ext, ws_vect) {
   yr_mask
 }
 
+# ── helper: broad-class fractions within a watershed for one year ─────────────
+# (replaces glc_watershed_summary.csv, which covers only 110 comids and 2009-2022;
+#  computing from the GLC rasters works for any comid and gives a true 1985 baseline)
+lc_fractions <- function(yr, ws_ext, ws_vect) {
+  lc <- get_lc_year(yr, ws_ext, ws_vect)
+  if (is.null(lc)) return(NULL)
+  v <- as.vector(terra::values(lc)); v <- v[!is.na(v)]
+  if (length(v) == 0) return(NULL)
+  ids <- if (is.numeric(v)) v else match(as.character(v), broad_labels)  # codes or labels
+  tab <- table(factor(ids, levels = 1:8))
+  tibble(year = yr, class = factor(broad_labels, levels = broad_labels),
+         fraction = as.numeric(tab) / sum(tab))
+}
+
 # ── main loop ─────────────────────────────────────────────────────────────────
 
 dir.create('figs', showWarnings = FALSE, recursive = TRUE)
@@ -210,16 +187,33 @@ for (i in seq_along(comids_to_map)) {
   ws_vect   <- vect(poc_shed)
   ws_ext    <- ext(st_bbox(poc_shed)) + 0.01
 
-  message('\n=== Static plot for COMID ', poc_comid, ' ===')
+  # monitoring sites physically inside this watershed (containment default)
+  chem_here  <- chem_pts$site_id[lengths(st_within(chem_pts, poc_shed)) > 0]
+  macro_here <- macro_pts$site_id[lengths(st_within(macro_pts, poc_shed)) > 0]
+
+  if (AGG_MODE == 'hybrid') {
+    # chem: the site(s) snapped to THIS reach (harmonized crosswalk); macro: the
+    # single nearest macro site to that reach -- reach-scale, like the original.
+    xw_h <- read_csv('data/watersheds_nhdhr/harmonized/site_comid_lookup.csv',
+                     show_col_types = FALSE)
+    reach_sites <- xw_h$site_id[xw_h$comid == poc_comid]
+    ch <- intersect(reach_sites, chem_pts$site_id)
+    if (length(ch) > 0) chem_here <- ch
+    reach_loc <- chem_pts %>% filter(site_id %in% chem_here) %>%
+      st_union() %>% st_centroid()
+    if (length(reach_loc) == 0) reach_loc <- st_centroid(st_union(poc_shed))
+    macro_here <- macro_pts$site_id[st_nearest_feature(reach_loc, macro_pts)]
+    message('  hybrid: reach chem sites = ', paste(chem_here, collapse = ', '),
+            ' | nearest macro site = ', paste(macro_here, collapse = ', '))
+  }
+
+  message('\n=== Static plot for COMID ', poc_comid, ' === (',
+          length(chem_here), ' chem sites, ', length(macro_here), ' macro sites)')
 
   # ── 1. Land cover change from 1985 baseline ────────────────────────────────
 
-  cur_lc <- glc_smry %>%
-    filter(comid == poc_comid) %>%
-    select(year, all_of(broad_labels)) %>%
-    pivot_longer(-year, names_to = 'class', values_to = 'fraction') %>%
-    mutate(class = factor(class, levels = broad_labels),
-           pct = fraction * 100)
+  cur_lc <- map_dfr(all_years, ~ lc_fractions(.x, ws_ext, ws_vect)) %>%
+    mutate(pct = fraction * 100)
 
   baseline <- cur_lc %>%
     filter(year == min(year)) %>%
@@ -234,7 +228,7 @@ for (i in seq_along(comids_to_map)) {
     geom_line(linewidth = 0.8) +
     geom_point(size = 0.8) +
     scale_color_manual(values = broad_colors, name = 'Land cover') +
-    labs(x = NULL, y = 'Change from 1985 (%)',
+    labs(x = NULL, y = paste0('Change from ', min(cur_lc$year), ' (%)'),
          title = 'Land cover change') +
     theme_minimal(base_size = 11) +
     theme(legend.position = 'none',
@@ -243,12 +237,12 @@ for (i in seq_along(comids_to_map)) {
 
   # ── 2. Cumulative mining extent ─────────────────────────────────────────────
 
-  mines_ws <- st_intersection(mines_raw, poc_shed) %>% st_make_valid()
-  ws_area_km2 <- as.numeric(st_area(st_union(poc_shed))) / 1e6
+  poc_shed_p  <- st_make_valid(st_transform(poc_shed, 3005))
+  mines_ws    <- suppressWarnings(st_intersection(mines_raw, poc_shed_p)) %>% st_make_valid()
+  ws_area_km2 <- as.numeric(st_area(st_union(poc_shed_p))) / 1e6
 
   if (nrow(mines_ws) > 0) {
     mine_yrs_ws <- sort(unique(mines_ws$DN))
-    sf_use_s2(FALSE)
     ts_mining <- tibble(
       year = mine_yrs_ws,
       area_km2 = sapply(mine_yrs_ws, function(y) {
@@ -256,7 +250,6 @@ for (i in seq_along(comids_to_map)) {
         as.numeric(st_area(cum)) / 1e6
       })
     )
-    sf_use_s2(TRUE)
     ts_mining <- tibble(year = as.numeric(all_years)) %>%
       left_join(ts_mining, by = 'year') %>%
       arrange(year) %>%
@@ -277,12 +270,12 @@ for (i in seq_along(comids_to_map)) {
 
   # ── 3. Selenium ─────────────────────────────────────────────────────────────
 
-  ts_se <- chem_se %>%
-    filter(comid == poc_comid) %>%
+  se_here <- function(an) elkchem %>%
+    filter(site_id %in% chem_here, analyte == an) %>%
     group_by(Year) %>%
-    summarize(val = median(val, na.rm = TRUE), .groups = 'drop') %>%
+    summarize(val = median(Value, na.rm = TRUE), .groups = 'drop') %>%
     arrange(Year)
-  if (poc_comid == '55001100244332') ts_se <- filter(ts_se, Year != 2012)
+  ts_se <- se_here('Selenium')
 
   p3 <- ggplot(ts_se, aes(x = Year, y = val)) +
     geom_line(color = '#e41a1c', linewidth = 0.8) +
@@ -293,17 +286,8 @@ for (i in seq_along(comids_to_map)) {
 
   # ── 4. NO3 + SO4 ───────────────────────────────────────────────────────────
 
-  ts_so4 <- chem_so4 %>%
-    filter(comid == poc_comid) %>%
-    group_by(Year) %>%
-    summarize(val = median(val, na.rm = TRUE), .groups = 'drop') %>%
-    mutate(param = 'SO4') %>% arrange(Year)
-
-  ts_no3 <- chem_no3 %>%
-    filter(comid == poc_comid) %>%
-    group_by(Year) %>%
-    summarize(val = median(val, na.rm = TRUE), .groups = 'drop') %>%
-    mutate(param = 'NO3') %>% arrange(Year)
+  ts_so4 <- se_here('Sulfate') %>% mutate(param = 'SO4')
+  ts_no3 <- se_here('Nitrate') %>% mutate(param = 'NO3')
 
   ts_nutrients <- bind_rows(ts_so4, ts_no3)
 
@@ -322,12 +306,16 @@ for (i in seq_along(comids_to_map)) {
 
   # ── 5. Invertebrate density ─────────────────────────────────────────────────
 
+  # per-sample (site x visit) totals, then averaged per year -- intensive metrics
+  # that don't blow up when many sites fall inside a large watershed
   ts_macro <- macro %>%
-    filter(comid == poc_comid) %>%
+    filter(site_id %in% macro_here) %>%
+    group_by(site_id, sample_date, Year) %>%
+    summarize(samp_density  = sum(Count, na.rm = TRUE),
+              samp_richness = length(unique(na.omit(Genus))), .groups = 'drop') %>%
     group_by(Year) %>%
-    summarize(density  = sum(Count, na.rm = TRUE),
-              richness = length(unique(na.omit(Genus))),
-              .groups = 'drop') %>%
+    summarize(density  = mean(samp_density),
+              richness = mean(samp_richness), .groups = 'drop') %>%
     arrange(Year)
 
   p5 <- ggplot(ts_macro, aes(x = Year, y = density)) +
@@ -424,7 +412,7 @@ for (i in seq_along(comids_to_map)) {
       theme = theme(plot.title = element_text(face = 'bold', size = 14, hjust = 0.5))
     )
 
-  out_png <- paste0('figs/all_trends_comid_', poc_comid, '.png')
+  out_png <- paste0('figs/all_trends_comid_', poc_comid, out_suffix, '.png')
   ggsave(out_png, combined, width = 16, height = 10, dpi = 300)
   message('Saved ', out_png)
 }
