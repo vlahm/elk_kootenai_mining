@@ -50,11 +50,13 @@ macro_raemp <- suppressWarnings(read_xlsx('data/harmonized/ElkMacro.xlsx')) %>%
   filter(SAMPLING_AGENCY == 'RAEMP') %>%
   transmute(site_id = STATION_NUMBER, lon = LongitudeMeasure, lat = LatitudeMeasure,
             sample_date = as_date(date), Year = as.integer(year),
-            Genus = na_if(as.character(Unit), '-'), Count = Value)
+            Genus = na_if(as.character(Unit), '-'), Count = Value,
+            agency = SAMPLING_AGENCY, program = 'RAEMP')
 macro_pub <- suppressWarnings(read_xlsx('data/for_reals/MacroC.xlsx')) %>%
   transmute(site_id = STATION_NUMBER, lon = LongitudeMeasure, lat = LatitudeMeasure,
             sample_date = as_date(SampleDate), Year = year(as_date(SampleDate)),
-            Genus = na_if(as.character(Unit), '-'), Count = Value)
+            Genus = na_if(as.character(Unit), '-'), Count = Value,
+            agency = SAMPLING_AGENCY, program = 'non-RAEMP')
 macro <- bind_rows(macro_raemp, macro_pub) %>% filter(!is.na(lon), !is.na(lat))
 
 # site points for spatial containment (built once)
@@ -138,20 +140,17 @@ basin_outline <- st_read('data/elk_kootenai_basin/KootenaiShape.shp', quiet = TR
   st_transform(4326) %>%
   st_make_valid()
 
-# ── helper: get reclassified land cover raster for one year ───────────────────
-
+# ── helper: reclassified land cover raster for one year, cropped to watershed ─
+# Reads only the one band needed per year (a whole-stack crop turned out slower:
+# merging all 23 bands across tiles forces expensive cross-tile resampling).
+# A per-comid memo (below) makes sure each year is computed only once, even
+# though 1985 & 2022 are used by both the change panel and the maps.
 get_lc_year <- function(yr, ws_ext, ws_vect) {
-  if (yr %in% late_years) {
-    band  <- which(late_years == yr)
-    files <- late_files
-  } else {
-    band  <- which(early_years == yr)
-    files <- early_files
-  }
+  band  <- if (yr %in% late_years) which(late_years == yr) else which(early_years == yr)
+  files <- if (yr %in% late_years) late_files else early_files
   crops <- lapply(files, function(f) {
-    r  <- rast(f, lyrs = band)
-    ov <- intersect(ext(r), ws_ext)
-    if (!is.null(ov)) crop(r, ws_ext) else NULL
+    r <- rast(f, lyrs = band)
+    if (is.null(intersect(ext(r), ws_ext))) NULL else crop(r, ws_ext)
   })
   crops <- crops[!sapply(crops, is.null)]
   if (length(crops) == 0) return(NULL)
@@ -162,15 +161,11 @@ get_lc_year <- function(yr, ws_ext, ws_vect) {
   yr_mask
 }
 
-# ── helper: broad-class fractions within a watershed for one year ─────────────
-# (replaces glc_watershed_summary.csv, which covers only 110 comids and 2009-2022;
-#  computing from the GLC rasters works for any comid and gives a true 1985 baseline)
-lc_fractions <- function(yr, ws_ext, ws_vect) {
-  lc <- get_lc_year(yr, ws_ext, ws_vect)
-  if (is.null(lc)) return(NULL)
+# broad-class fractions for one (pre-cropped) year raster
+lc_fractions_from <- function(lc, yr) {
   v <- as.vector(terra::values(lc)); v <- v[!is.na(v)]
   if (length(v) == 0) return(NULL)
-  ids <- if (is.numeric(v)) v else match(as.character(v), broad_labels)  # codes or labels
+  ids <- if (is.numeric(v)) v else match(as.character(v), broad_labels)
   tab <- table(factor(ids, levels = 1:8))
   tibble(year = yr, class = factor(broad_labels, levels = broad_labels),
          fraction = as.numeric(tab) / sum(tab))
@@ -186,6 +181,15 @@ for (i in seq_along(comids_to_map)) {
   poc_shed  <- sheds %>% filter(comid == poc_comid) %>% st_transform(4326)
   ws_vect   <- vect(poc_shed)
   ws_ext    <- ext(st_bbox(poc_shed)) + 0.01
+  # per-comid memo so each year's land cover is computed once (reused by the
+  # change panel and the 1985/2022 maps)
+  lc_env <- new.env()
+  get_lc <- function(yr) {
+    k <- as.character(yr)
+    if (is.null(lc_env[[k]]))
+      lc_env[[k]] <- { r <- get_lc_year(yr, ws_ext, ws_vect); if (is.null(r)) 'NODATA' else r }
+    v <- lc_env[[k]]; if (identical(v, 'NODATA')) NULL else v
+  }
 
   # monitoring sites physically inside this watershed (containment default)
   chem_here  <- chem_pts$site_id[lengths(st_within(chem_pts, poc_shed)) > 0]
@@ -212,7 +216,8 @@ for (i in seq_along(comids_to_map)) {
 
   # ── 1. Land cover change from 1985 baseline ────────────────────────────────
 
-  cur_lc <- map_dfr(all_years, ~ lc_fractions(.x, ws_ext, ws_vect)) %>%
+  cur_lc <- map_dfr(all_years, ~ { lc <- get_lc(.x)
+                                    if (is.null(lc)) NULL else lc_fractions_from(lc, .x) }) %>%
     mutate(pct = fraction * 100)
 
   baseline <- cur_lc %>%
@@ -260,8 +265,8 @@ for (i in seq_along(comids_to_map)) {
   }
 
   p2 <- ggplot(ts_mining, aes(x = year, y = area_km2)) +
-    geom_line(color = '#e41a1c', linewidth = 0.8) +
-    geom_point(color = '#e41a1c', size = 0.8) +
+    geom_line(color = 'black', linewidth = 0.8) +
+    geom_point(color = 'black', size = 0.8) +
     labs(x = NULL, y = expression('Cum. area (km'^2*')'),
          title = 'Cumulative mining extent') +
     theme_minimal(base_size = 11) +
@@ -278,8 +283,8 @@ for (i in seq_along(comids_to_map)) {
   ts_se <- se_here('Selenium')
 
   p3 <- ggplot(ts_se, aes(x = Year, y = val)) +
-    geom_line(color = '#e41a1c', linewidth = 0.8) +
-    geom_point(color = '#e41a1c', size = 0.8) +
+    geom_line(color = 'black', linewidth = 0.8) +
+    geom_point(color = 'black', size = 0.8) +
     labs(x = 'Year', y = 'Se (µg/L)', title = 'Selenium') +
     theme_minimal(base_size = 11) +
     theme(plot.title = element_text(face = 'bold', size = 11))
@@ -294,7 +299,7 @@ for (i in seq_along(comids_to_map)) {
   p4 <- ggplot(ts_nutrients, aes(x = Year, y = val, color = param)) +
     geom_line(linewidth = 0.8) +
     geom_point(size = 0.8) +
-    scale_color_manual(values = c('SO4' = '#377eb8', 'NO3' = '#4daf4a'),
+    scale_color_manual(values = c('SO4' = 'black', 'NO3' = 'grey60'),
                        name = NULL) +
     labs(x = NULL, y = 'Concentration (mg/L)',
          title = 'NO3 & SO4') +
@@ -319,8 +324,8 @@ for (i in seq_along(comids_to_map)) {
     arrange(Year)
 
   p5 <- ggplot(ts_macro, aes(x = Year, y = density)) +
-    geom_line(color = '#984ea3', linewidth = 0.8) +
-    geom_point(color = '#984ea3', size = 0.8) +
+    geom_line(color = 'black', linewidth = 0.8) +
+    geom_point(color = 'black', size = 0.8) +
     labs(x = NULL, y = expression('Density (m'^-2*')'),
          title = 'Invertebrate density') +
     theme_minimal(base_size = 11) +
@@ -330,8 +335,8 @@ for (i in seq_along(comids_to_map)) {
   # ── 6. Invertebrate genus richness ──────────────────────────────────────────
 
   p6 <- ggplot(ts_macro, aes(x = Year, y = richness)) +
-    geom_line(color = '#ff7f00', linewidth = 0.8) +
-    geom_point(color = '#ff7f00', size = 0.8) +
+    geom_line(color = 'black', linewidth = 0.8) +
+    geom_point(color = 'black', size = 0.8) +
     labs(x = 'Year', y = 'Richness',
          title = 'Genus richness') +
     theme_minimal(base_size = 11) +
@@ -339,16 +344,24 @@ for (i in seq_along(comids_to_map)) {
 
   # ── right column: inset map, legend, 1985 & 2022 land cover ────────────────
 
-  # inset map
+  # inset map, with the chem & macro sampling locations used in this figure
   bb <- st_bbox(basin_outline)
+  site_pts <- bind_rows(
+    chem_pts  %>% filter(site_id %in% chem_here)  %>% mutate(kind = 'chemistry'),
+    macro_pts %>% filter(site_id %in% macro_here) %>% mutate(kind = 'macroinvertebrate'))
   p_inset <- ggplot() +
     geom_sf(data = basin_outline, fill = 'grey90', color = 'grey50') +
     geom_sf(data = poc_shed, fill = '#d7191c55', color = '#d7191c', linewidth = 0.8) +
+    geom_sf(data = site_pts, aes(color = kind, shape = kind), size = 2.4, stroke = 1.1) +
+    scale_color_manual(values = c(chemistry = '#1f4e79', macroinvertebrate = '#e6550d'), name = NULL) +
+    scale_shape_manual(values = c(chemistry = 17, macroinvertebrate = 16), name = NULL) +
     coord_sf(xlim = c(bb['xmin'], bb['xmax']),
              ylim = c(bb['ymin'], bb['ymax'])) +
     labs(title = paste0('COMID ', poc_comid)) +
     theme_void(base_size = 11) +
-    theme(plot.title = element_text(face = 'bold', size = 11, hjust = 0.5))
+    theme(plot.title = element_text(face = 'bold', size = 11, hjust = 0.5),
+          legend.position = 'bottom', legend.text = element_text(size = 8),
+          legend.key.height = unit(0.8, 'lines'))
 
   # land cover legend
   # find classes present in any year for this watershed
@@ -366,12 +379,12 @@ for (i in seq_along(comids_to_map)) {
     scale_fill_manual(values = broad_colors, guide = 'none') +
     xlim(0.8, 2.5) +
     theme_void() +
-    labs(title = 'Land cover classes') +
+    labs(title = 'GLC land cover classes') +
     theme(plot.title = element_text(face = 'bold', size = 10, hjust = 0.5))
 
   # static land cover maps for 1985 and 2022
   make_lc_ggplot <- function(yr) {
-    lc <- get_lc_year(yr, ws_ext, ws_vect)
+    lc <- get_lc(yr)
     if (is.null(lc)) {
       return(ggplot() + theme_void() +
                labs(title = paste0(yr, ' — no data')) +
@@ -398,6 +411,26 @@ for (i in seq_along(comids_to_map)) {
   p_lc1985 <- make_lc_ggplot(1985)
   p_lc2022 <- make_lc_ggplot(2022)
 
+  # ── caption: where the invertebrate data come from ─────────────────────────
+  macro_src  <- macro %>% filter(site_id %in% macro_here)
+  n_events   <- nrow(distinct(macro_src, site_id, sample_date))
+  yr_rng     <- paste(range(macro_src$Year, na.rm = TRUE), collapse = '–')
+  agency     <- paste(sort(unique(na.omit(macro_src$agency))), collapse = '; ')
+  raemp_note <- if (all(macro_src$program == 'RAEMP'))
+                  'the coal-industry Regional Aquatic Effects Monitoring Program (RAEMP)'
+                else 'independent monitoring, not the coal-industry RAEMP program'
+  if (AGG_MODE == 'hybrid') {
+    macro_desc <- paste0('macroinvertebrate site ', paste(macro_here, collapse = ', '),
+                         ' — the benthic-monitoring station nearest this watershed’s reach')
+  } else {
+    macro_desc <- paste0(length(macro_here), ' macroinvertebrate stations within the watershed')
+  }
+  invert_caption <- paste0(
+    'Invertebrate density and genus richness (black lines) are from ', macro_desc,
+    ', operated by ', agency, ' (', raemp_note, '): ', n_events, ' benthic samples, ',
+    yr_rng, '. Water chemistry (Se, SO4, NO3) is from the reach-snapped monitoring station(s); ',
+    'land cover and cumulative mining are integrated over the full upstream watershed shown at right.')
+
   # ── assemble with patchwork ─────────────────────────────────────────────────
 
   left_col  <- (p1 / p2 / p3) + plot_layout(axes = 'collect_x')
@@ -408,11 +441,15 @@ for (i in seq_along(comids_to_map)) {
   combined <- (left_col | mid_col | right_col) +
     plot_layout(widths = c(2, 2, 1.2)) +
     plot_annotation(
-      title = paste0('Watershed ', poc_comid, ' — Land Cover, Mining & Water Quality'),
-      theme = theme(plot.title = element_text(face = 'bold', size = 14, hjust = 0.5))
-    )
+      title = paste0('Watershed ', poc_comid, ': Land Cover, Mining & Water Quality'),
+      theme = theme(plot.title = element_text(face = 'bold', size = 14, hjust = 0.5)))
 
   out_png <- paste0('figs/all_trends_comid_', poc_comid, out_suffix, '.png')
   ggsave(out_png, combined, width = 16, height = 10, dpi = 300)
   message('Saved ', out_png)
+
+  # caption text emitted to stdout (kept off the figure) for copy-paste
+  cat('\n===== FIGURE CAPTION (comid ', poc_comid, ') =====\n', sep = '')
+  cat(invert_caption, '\n')
+  cat('=================================================\n')
 }
