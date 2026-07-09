@@ -47,20 +47,19 @@ elkchem <- suppressWarnings(read_xlsx('data/harmonized/ElkChem.xlsx')) %>%
   transmute(site_id = STATION_NUMBER, lon = longitude, lat = latitude,
             analyte, Value, Year = year)
 
-macro_raemp <- suppressWarnings(read_xlsx('data/harmonized/ElkMacro.xlsx')) %>%
-  filter(SAMPLING_AGENCY == 'RAEMP') %>%
+# Macroinvertebrate data: ElkMacro only. ElkMacro was built in part from MacroC,
+# and for the Elk watersheds it already carries the full station network; excluding
+# MacroC leaves the hybrid figure byte-identical (site ELK01 matches row-for-row)
+# and the 327683 station set / taxa unchanged. MacroC's extras are Kootenai-side.
+# Dates are M/D/YYYY, so parse with mdy() (as_date() returns all NA).
+macro <- suppressWarnings(read_xlsx('data/harmonized/ElkMacro.xlsx')) %>%
   transmute(site_id = STATION_NUMBER, lon = LongitudeMeasure, lat = LatitudeMeasure,
-            sample_date = as_date(date), Year = as.integer(year),
+            sample_date = mdy(date), Year = as.integer(year),
             Genus = na_if(as.character(Unit), '-'), Count = Value,
-            order = as.character(Order_),
-            agency = SAMPLING_AGENCY, program = 'RAEMP')
-macro_pub <- suppressWarnings(read_xlsx('data/for_reals/MacroC.xlsx')) %>%
-  transmute(site_id = STATION_NUMBER, lon = LongitudeMeasure, lat = LatitudeMeasure,
-            sample_date = as_date(SampleDate), Year = year(as_date(SampleDate)),
-            Genus = na_if(as.character(Unit), '-'), Count = Value,
-            order = as.character(Order),
-            agency = SAMPLING_AGENCY, program = 'non-RAEMP')
-macro <- bind_rows(macro_raemp, macro_pub) %>% filter(!is.na(lon), !is.na(lat))
+            order = as.character(Order_), family = as.character(Family),
+            agency = SAMPLING_AGENCY,
+            program = if_else(SAMPLING_AGENCY == 'RAEMP', 'RAEMP', 'non-RAEMP')) %>%
+  filter(!is.na(lon), !is.na(lat))
 
 # site points for spatial containment (built once)
 chem_pts  <- elkchem %>% distinct(site_id, lon, lat) %>%
@@ -76,7 +75,7 @@ macro_pts <- macro %>% distinct(site_id, lon, lat) %>%
 # the harmonized inputs for a like-for-like comparison. (To re-run the automatic
 # "strongest declining richness" selection instead, restore that block and point
 # it at chem_macro_set1/sheds_good.)
-comids_to_map <- c(55001100327683, 55001100073395)
+comids_to_map <- c(55001100327683)   # , 55001100073395)  # 073395 excluded per request
 if (AGG_MODE == 'hybrid') comids_to_map <- 55001100327683   # the important figure only
 message('Rebuilding COMIDs: ', paste(comids_to_map, collapse = ', '))
 
@@ -345,27 +344,53 @@ for (i in seq_along(comids_to_map)) {
           axis.text.x = element_blank(),
           plot.title = element_text(face = 'bold', size = 11))
 
-  # ── 5. Invertebrate density ─────────────────────────────────────────────────
+  # ── 5. Macroinvertebrate density: two family groups ─────────────────────────
 
-  # per-sample (site x visit) totals, then averaged per year -- intensive metrics
-  # that don't blow up when many sites fall inside a large watershed
+  # per-sample (site x visit) totals averaged per year -- intensive metrics that
+  # don't blow up when many sites fall inside a large watershed. ts_macro drives
+  # genus richness (all taxa); density is split into two family groups below.
   ts_macro <- macro %>%
     filter(site_id %in% macro_here) %>%
     group_by(site_id, sample_date, Year) %>%
-    summarize(samp_density  = sum(Count, na.rm = TRUE),
-              samp_richness = length(unique(na.omit(Genus))), .groups = 'drop') %>%
+    summarize(samp_richness = length(unique(na.omit(Genus))), .groups = 'drop') %>%
     group_by(Year) %>%
-    summarize(density  = mean(samp_density),
-              richness = mean(samp_richness), .groups = 'drop') %>%
+    summarize(richness = mean(samp_richness), .groups = 'drop') %>%
     arrange(Year)
 
-  p5 <- ggplot(ts_macro, aes(x = Year, y = density)) +
-    geom_line(color = 'black', linewidth = 0.8) +
-    geom_point(color = 'black', size = 0.8) +
+  grpA_lbl <- 'Elmidae, Brachycentridae, Simuliidae, Lebertiidae'
+  grpB_lbl <- 'Chloroperlidae, Taeniopterygidae, Heptageniidae, Ephemerellidae'
+  grp_families <- tibble(
+    family = c('Elmidae', 'Brachycentridae', 'Simuliidae', 'Lebertiidae',
+               'Chloroperlidae', 'Taeniopterygidae', 'Heptageniidae', 'Ephemerellidae'),
+    grp = rep(c(grpA_lbl, grpB_lbl), each = 4))
+
+  # per-group per-sample density (0 when a group is absent from a sample), then
+  # averaged across samples per year
+  macro_in <- macro %>% filter(site_id %in% macro_here)
+  samples  <- macro_in %>% distinct(site_id, sample_date, Year)
+  ts_fam <- lapply(c(grpA_lbl, grpB_lbl), function(g) {
+    fams <- grp_families$family[grp_families$grp == g]
+    macro_in %>% filter(family %in% fams) %>%
+      group_by(site_id, sample_date, Year) %>%
+      summarize(d = sum(Count, na.rm = TRUE), .groups = 'drop') %>%
+      right_join(samples, by = c('site_id', 'sample_date', 'Year')) %>%
+      mutate(d = tidyr::replace_na(d, 0)) %>%
+      group_by(Year) %>% summarize(density = mean(d), .groups = 'drop') %>%
+      mutate(grp = g)
+  }) %>% bind_rows() %>%
+    mutate(grp = factor(grp, levels = c(grpA_lbl, grpB_lbl))) %>% arrange(Year)
+
+  p5 <- ggplot(ts_fam, aes(x = Year, y = density, color = grp)) +
+    geom_line(linewidth = 0.8) + geom_point(size = 0.8) +
+    scale_color_manual(values = setNames(c('black', 'grey60'), c(grpA_lbl, grpB_lbl)),
+                       name = NULL, labels = function(x) str_wrap(x, 26)) +
     labs(x = NULL, y = expression('Density (m'^-2*')'),
          title = 'Macroinvertebrate density') +
     theme_minimal(base_size = 11) +
-    theme(axis.text.x = element_blank(),
+    theme(legend.position = c(0.02, 0.98), legend.justification = c(0, 1),
+          legend.text = element_text(size = 6.5), legend.key.height = unit(0.9, 'lines'),
+          legend.background = element_rect(fill = alpha('white', 0.6), color = NA),
+          axis.text.x = element_blank(),
           plot.title = element_text(face = 'bold', size = 11))
 
   # ── 6. Invertebrate genus richness ──────────────────────────────────────────
@@ -391,10 +416,17 @@ for (i in seq_along(comids_to_map)) {
     theme_void(base_size = 11) +
     theme(plot.title = element_text(face = 'bold', size = 11, hjust = 0.5))
 
-  # single sampling-location marker for the land-cover maps: chem & macro sites
-  # are essentially co-located, so we show one point (the chem site) for both
-  sampling_loc <- chem_pts %>% filter(site_id %in% chem_here) %>%
-    st_union() %>% st_centroid() %>% st_sf() %>% mutate(label = 'Sampling location')
+  # sampling locations for the land-cover maps
+  if (AGG_MODE == 'hybrid') {
+    # chem & macro sites are essentially co-located: one labelled point
+    map_sites <- chem_pts %>% filter(site_id %in% chem_here) %>%
+      st_union() %>% st_centroid() %>% st_sf() %>% mutate(type = 'Sampling location')
+  } else {
+    # the whole in-watershed monitoring network, as tiny points
+    map_sites <- bind_rows(
+      chem_pts  %>% filter(site_id %in% chem_here)  %>% mutate(type = 'Chemistry site'),
+      macro_pts %>% filter(site_id %in% macro_here) %>% mutate(type = 'Macroinvertebrate site'))
+  }
 
   # land cover legend
   # find classes present in any year for this watershed
@@ -430,14 +462,26 @@ for (i in seq_along(comids_to_map)) {
       filter(!is.na(class_id)) %>%
       mutate(class = factor(broad_labels[class_id], levels = broad_labels))
 
+    # sampling markers: one labelled diamond (hybrid) or the tiny-point network
+    if (AGG_MODE == 'hybrid') {
+      pt_layer <- list(
+        geom_sf(data = map_sites, aes(shape = type), color = 'black', fill = 'yellow',
+                size = 2.8, stroke = 1.1, inherit.aes = FALSE),
+        scale_shape_manual(values = c('Sampling location' = 23), name = NULL))
+    } else {
+      pt_layer <- list(
+        geom_sf(data = map_sites, aes(color = type), size = 0.5, inherit.aes = FALSE),
+        scale_color_manual(values = c('Chemistry site' = '#1f4e79',
+                                      'Macroinvertebrate site' = '#e6550d'), name = NULL),
+        guides(color = guide_legend(override.aes = list(size = 2))))
+    }
+
     ggplot(lc_df, aes(x = x, y = y, fill = class)) +
       geom_raster() +
       geom_sf(data = poc_shed, fill = NA, color = 'black',
               linewidth = 0.4, inherit.aes = FALSE) +
-      geom_sf(data = sampling_loc, aes(shape = label), color = 'black', fill = 'yellow',
-              size = 2.8, stroke = 1.1, inherit.aes = FALSE) +
+      pt_layer +
       scale_fill_manual(values = broad_colors, guide = 'none', drop = FALSE) +
-      scale_shape_manual(values = c('Sampling location' = 23), name = NULL) +
       coord_sf(expand = FALSE) +
       labs(title = yr) +
       theme_void(base_size = 11) +
@@ -461,17 +505,21 @@ for (i in seq_along(comids_to_map)) {
                 else 'independent monitoring, not the coal-industry RAEMP program'
   if (AGG_MODE == 'hybrid') {
     macro_desc <- paste0('macroinvertebrate site ', paste(macro_here, collapse = ', '),
-                         ' — the benthic-monitoring station nearest this watershed’s reach')
+                         ' — the benthic-monitoring station nearest this watershed’s reach, operated by ',
+                         agency, ' (', raemp_note, ')')
+    chem_desc  <- 'the reach-snapped chemistry station(s)'
   } else {
-    macro_desc <- paste0(length(macro_here), ' macroinvertebrate stations within the watershed')
+    macro_desc <- paste0('all ', length(macro_here),
+                         ' macroinvertebrate monitoring stations within the watershed')
+    chem_desc  <- paste0('all ', length(chem_here), ' chemistry stations within the watershed')
   }
   invert_caption <- paste0(
-    'Macroinvertebrate density and genus richness (black lines) are from ', macro_desc,
-    ', operated by ', agency, ' (', raemp_note, '): ', n_events, ' benthic samples, ',
-    yr_rng, '. All recorded taxa are included (no order-level filtering) — ', n_orders,
-    ' invertebrate orders and ', n_genera, ' genera. Water chemistry (Se, SO4, NO3) is from the ',
-    'reach-snapped monitoring station(s); land cover and cumulative mining are integrated over ',
-    'the full upstream watershed shown at right.')
+    'Macroinvertebrate density and genus richness are from ', macro_desc, ': ', n_events,
+    ' benthic samples, ', yr_rng, '. Genus richness includes all recorded taxa (', n_orders,
+    ' orders, ', n_genera, ' genera); density is split into two family groups — black: ', grpA_lbl,
+    '; grey: ', grpB_lbl, '. Water chemistry (Se, SO4, NO3) is from ', chem_desc,
+    '; land cover and cumulative mining are integrated over the full upstream watershed shown at right. ',
+    'Chemistry (blue) and macroinvertebrate (orange) sampling sites are marked on the land-cover maps.')
 
   # ── assemble with patchwork ─────────────────────────────────────────────────
 

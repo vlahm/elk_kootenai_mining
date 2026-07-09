@@ -1,6 +1,6 @@
 # snap_harmonized_sites.R
 # Rebuild the site -> watershed-comid crosswalk for the HARMONIZED site list
-# (ElkChem chemistry + ElkMacro/MacroC macro), snapping to the CORRECT
+# (ElkChem chemistry + ElkMacro macro), snapping to the CORRECT
 # Elk-Kootenai NHDPlus-HR flowlines (data/nhdplushr/elk_kootenai/, VPUID 1701;
 # the top-level nhdplushr_merged.gpkg has been overwritten with NH/ME data).
 #
@@ -21,12 +21,11 @@ chem_sites <- suppressWarnings(read_xlsx('data/harmonized/ElkChem.xlsx')) %>%
   transmute(site_id = STATION_NUMBER, lon = longitude, lat = latitude, source = 'chem') %>%
   filter(!is.na(lon), !is.na(lat)) %>% distinct(site_id, .keep_all = TRUE)
 
-macro_sites <- bind_rows(
-  suppressWarnings(read_xlsx('data/harmonized/ElkMacro.xlsx')) %>%
-    transmute(site_id = STATION_NUMBER, lon = LongitudeMeasure, lat = LatitudeMeasure),
-  suppressWarnings(read_xlsx('data/for_reals/MacroC.xlsx')) %>%
-    transmute(site_id = STATION_NUMBER, lon = LongitudeMeasure, lat = LatitudeMeasure)
-) %>% filter(!is.na(lon), !is.na(lat)) %>%
+# ElkMacro only (matches kitchen_sink_plots.R; ElkMacro carries the full Elk macro
+# network, and MacroC was found to add only redundant/Kootenai-side sites).
+macro_sites <- suppressWarnings(read_xlsx('data/harmonized/ElkMacro.xlsx')) %>%
+  transmute(site_id = STATION_NUMBER, lon = LongitudeMeasure, lat = LatitudeMeasure) %>%
+  filter(!is.na(lon), !is.na(lat)) %>%
   distinct(site_id, .keep_all = TRUE) %>% mutate(source = 'macro')
 
 # union of all sites (a site_id in both chem & macro keeps one row / one comid)
