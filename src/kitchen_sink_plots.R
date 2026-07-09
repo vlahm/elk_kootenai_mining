@@ -5,6 +5,7 @@ library(lubridate)
 library(ggplot2)
 library(terra)
 library(patchwork)
+library(exactextractr)
 
 options(scipen = 999)   # keep 14-digit comids out of scientific notation
 sf_use_s2(FALSE)        # planar geometry ops (areas computed in projected CRS below)
@@ -51,11 +52,13 @@ macro_raemp <- suppressWarnings(read_xlsx('data/harmonized/ElkMacro.xlsx')) %>%
   transmute(site_id = STATION_NUMBER, lon = LongitudeMeasure, lat = LatitudeMeasure,
             sample_date = as_date(date), Year = as.integer(year),
             Genus = na_if(as.character(Unit), '-'), Count = Value,
+            order = as.character(Order_),
             agency = SAMPLING_AGENCY, program = 'RAEMP')
 macro_pub <- suppressWarnings(read_xlsx('data/for_reals/MacroC.xlsx')) %>%
   transmute(site_id = STATION_NUMBER, lon = LongitudeMeasure, lat = LatitudeMeasure,
             sample_date = as_date(SampleDate), Year = year(as_date(SampleDate)),
             Genus = na_if(as.character(Unit), '-'), Count = Value,
+            order = as.character(Order),
             agency = SAMPLING_AGENCY, program = 'non-RAEMP')
 macro <- bind_rows(macro_raemp, macro_pub) %>% filter(!is.na(lon), !is.na(lat))
 
@@ -115,6 +118,9 @@ rcl_mat <- matrix(c(
   210, 6,  220, 8,  250, NA
 ), ncol = 2, byrow = TRUE)
 
+# named lookup 30-class code -> broad id (1-8); codes not present -> NA (nodata)
+rcl_lookup <- setNames(rcl_mat[, 2], as.character(rcl_mat[, 1]))
+
 broad_labels <- c('forest', 'shrubland', 'grassland', 'cropland',
                   'wetland', 'water', 'impervious', 'barren_snow_ice')
 
@@ -132,7 +138,7 @@ broad_colors <- c(
 # ── SkyTruth mines ─────────────────────────────────────────────────────────────
 
 mines_raw <- st_read('data/skytruth/mining_extent_firstMined_1984_2025_med0-7.geojson') %>%
-  st_transform(3005) %>% st_make_valid()   # BC Albers -> planar area in km^2, no lwgeom needed
+  st_transform(3005)   # BC Albers (planar); rasterized per-watershed below
 
 # ── basin outline (for inset) ─────────────────────────────────────────────────
 
@@ -162,13 +168,39 @@ get_lc_year <- function(yr, ws_ext, ws_vect) {
 }
 
 # broad-class fractions for one (pre-cropped) year raster
-lc_fractions_from <- function(lc, yr) {
-  v <- as.vector(terra::values(lc)); v <- v[!is.na(v)]
-  if (length(v) == 0) return(NULL)
-  ids <- if (is.numeric(v)) v else match(as.character(v), broad_labels)
-  tab <- table(factor(ids, levels = 1:8))
-  tibble(year = yr, class = factor(broad_labels, levels = broad_labels),
-         fraction = as.numeric(tab) / sum(tab))
+# ── fast land-cover fractions for ALL years via exact_extract ─────────────────
+# For each overlapping GLC tile, extract every band once with coverage weights,
+# tally coverage by broad class, and sum across tiles -- no cross-tile merge or
+# resample, so the whole change panel is built in seconds rather than minutes.
+lc_fractions_fast <- function(poly) {
+  poly  <- st_sf(geometry = st_union(poly))
+  codes <- as.integer(names(rcl_lookup)); brd <- unname(rcl_lookup)
+  tally_files <- function(files, band_years, keep_years) {
+    acc <- setNames(lapply(keep_years, function(x) numeric(8)), as.character(keep_years))
+    for (f in files) {
+      r <- rast(f)
+      if (is.null(terra::intersect(ext(r), ext(vect(poly))))) next
+      ee  <- exact_extract(r, poly, progress = FALSE)[[1]]
+      cov <- ee$coverage_fraction
+      valcols <- setdiff(names(ee), 'coverage_fraction')
+      for (yr in keep_years) {
+        b8 <- brd[match(ee[[valcols[which(band_years == yr)]]], codes)]
+        ok <- !is.na(b8)
+        rs <- rowsum(cov[ok], b8[ok])
+        v  <- numeric(8); v[as.integer(rownames(rs))] <- rs[, 1]
+        acc[[as.character(yr)]] <- acc[[as.character(yr)]] + v
+      }
+    }
+    acc
+  }
+  acc <- c(tally_files(early_files, early_years, c(1985L, 1990L, 1995L)),
+           tally_files(late_files,  late_years,  late_years))
+  map_dfr(names(acc), function(y) {
+    v <- acc[[y]]; tot <- sum(v)
+    if (tot == 0) return(NULL)
+    tibble(year = as.integer(y), class = factor(broad_labels, levels = broad_labels),
+           fraction = v / tot)
+  })
 }
 
 # ── main loop ─────────────────────────────────────────────────────────────────
@@ -216,8 +248,7 @@ for (i in seq_along(comids_to_map)) {
 
   # ── 1. Land cover change from 1985 baseline ────────────────────────────────
 
-  cur_lc <- map_dfr(all_years, ~ { lc <- get_lc(.x)
-                                    if (is.null(lc)) NULL else lc_fractions_from(lc, .x) }) %>%
+  cur_lc <- lc_fractions_fast(poc_shed) %>%
     mutate(pct = fraction * 100)
 
   baseline <- cur_lc %>%
@@ -243,22 +274,27 @@ for (i in seq_along(comids_to_map)) {
   # ── 2. Cumulative mining extent ─────────────────────────────────────────────
 
   poc_shed_p  <- st_make_valid(st_transform(poc_shed, 3005))
-  mines_ws    <- suppressWarnings(st_intersection(mines_raw, poc_shed_p)) %>% st_make_valid()
   ws_area_km2 <- as.numeric(st_area(st_union(poc_shed_p))) / 1e6
 
-  if (nrow(mines_ws) > 0) {
-    mine_yrs_ws <- sort(unique(mines_ws$DN))
-    ts_mining <- tibble(
-      year = mine_yrs_ws,
-      area_km2 = sapply(mine_yrs_ws, function(y) {
-        cum <- mines_ws %>% filter(DN <= y) %>% st_union() %>% st_make_valid()
-        as.numeric(st_area(cum)) / 1e6
-      })
-    )
+  # Clip mining to the watershed by RASTERIZING (GDAL), not a vector overlay:
+  # a GEOS intersection of the ~13k footprint polygons is pathologically slow
+  # once terra/exactextractr are loaded (they change the GEOS linkage). We
+  # rasterize first-mined-year (DN) at 30 m and coverage-weight the cells; the
+  # firstMined footprint is non-overlapping, so cumulative area is a cumsum.
+  # (Verified against the vector union: 119.33 vs 119.34 km^2.)
+  dn_r <- rasterize(vect(mines_raw), rast(vect(poc_shed_p), resolution = 30),
+                    field = 'DN', fun = 'min')
+  mm   <- exact_extract(dn_r, poc_shed_p, progress = FALSE)[[1]]
+  names(mm)[1] <- 'DN'
+  per_dn <- mm %>% filter(!is.na(DN)) %>% group_by(DN) %>%
+    summarize(a = sum(coverage_fraction) * 900 / 1e6, .groups = 'drop') %>%  # 30m cell = 900 m^2
+    arrange(DN) %>% mutate(cum = cumsum(a))
+
+  if (nrow(per_dn) > 0) {
     ts_mining <- tibble(year = as.numeric(all_years)) %>%
-      left_join(ts_mining, by = 'year') %>%
+      left_join(transmute(per_dn, year = DN, area_km2 = cum), by = 'year') %>%
       arrange(year) %>%
-      mutate(area_km2 = ifelse(year < min(mine_yrs_ws), 0, area_km2)) %>%
+      mutate(area_km2 = ifelse(year < min(per_dn$DN), 0, area_km2)) %>%
       tidyr::fill(area_km2, .direction = 'down')
   } else {
     ts_mining <- tibble(year = as.numeric(all_years), area_km2 = 0)
@@ -327,7 +363,7 @@ for (i in seq_along(comids_to_map)) {
     geom_line(color = 'black', linewidth = 0.8) +
     geom_point(color = 'black', size = 0.8) +
     labs(x = NULL, y = expression('Density (m'^-2*')'),
-         title = 'Invertebrate density') +
+         title = 'Macroinvertebrate density') +
     theme_minimal(base_size = 11) +
     theme(axis.text.x = element_blank(),
           plot.title = element_text(face = 'bold', size = 11))
@@ -338,30 +374,27 @@ for (i in seq_along(comids_to_map)) {
     geom_line(color = 'black', linewidth = 0.8) +
     geom_point(color = 'black', size = 0.8) +
     labs(x = 'Year', y = 'Richness',
-         title = 'Genus richness') +
+         title = 'Macroinvertebrate genus richness') +
     theme_minimal(base_size = 11) +
     theme(plot.title = element_text(face = 'bold', size = 11))
 
   # ── right column: inset map, legend, 1985 & 2022 land cover ────────────────
 
-  # inset map, with the chem & macro sampling locations used in this figure
+  # inset map (basin with this watershed highlighted)
   bb <- st_bbox(basin_outline)
-  site_pts <- bind_rows(
-    chem_pts  %>% filter(site_id %in% chem_here)  %>% mutate(kind = 'chemistry'),
-    macro_pts %>% filter(site_id %in% macro_here) %>% mutate(kind = 'macroinvertebrate'))
   p_inset <- ggplot() +
     geom_sf(data = basin_outline, fill = 'grey90', color = 'grey50') +
     geom_sf(data = poc_shed, fill = '#d7191c55', color = '#d7191c', linewidth = 0.8) +
-    geom_sf(data = site_pts, aes(color = kind, shape = kind), size = 2.4, stroke = 1.1) +
-    scale_color_manual(values = c(chemistry = '#1f4e79', macroinvertebrate = '#e6550d'), name = NULL) +
-    scale_shape_manual(values = c(chemistry = 17, macroinvertebrate = 16), name = NULL) +
     coord_sf(xlim = c(bb['xmin'], bb['xmax']),
              ylim = c(bb['ymin'], bb['ymax'])) +
     labs(title = paste0('COMID ', poc_comid)) +
     theme_void(base_size = 11) +
-    theme(plot.title = element_text(face = 'bold', size = 11, hjust = 0.5),
-          legend.position = 'bottom', legend.text = element_text(size = 8),
-          legend.key.height = unit(0.8, 'lines'))
+    theme(plot.title = element_text(face = 'bold', size = 11, hjust = 0.5))
+
+  # single sampling-location marker for the land-cover maps: chem & macro sites
+  # are essentially co-located, so we show one point (the chem site) for both
+  sampling_loc <- chem_pts %>% filter(site_id %in% chem_here) %>%
+    st_union() %>% st_centroid() %>% st_sf() %>% mutate(label = 'Sampling location')
 
   # land cover legend
   # find classes present in any year for this watershed
@@ -383,7 +416,7 @@ for (i in seq_along(comids_to_map)) {
     theme(plot.title = element_text(face = 'bold', size = 10, hjust = 0.5))
 
   # static land cover maps for 1985 and 2022
-  make_lc_ggplot <- function(yr) {
+  make_lc_ggplot <- function(yr, show_leg = FALSE) {
     lc <- get_lc(yr)
     if (is.null(lc)) {
       return(ggplot() + theme_void() +
@@ -401,20 +434,27 @@ for (i in seq_along(comids_to_map)) {
       geom_raster() +
       geom_sf(data = poc_shed, fill = NA, color = 'black',
               linewidth = 0.4, inherit.aes = FALSE) +
+      geom_sf(data = sampling_loc, aes(shape = label), color = 'black', fill = 'yellow',
+              size = 2.8, stroke = 1.1, inherit.aes = FALSE) +
       scale_fill_manual(values = broad_colors, guide = 'none', drop = FALSE) +
+      scale_shape_manual(values = c('Sampling location' = 23), name = NULL) +
       coord_sf(expand = FALSE) +
       labs(title = yr) +
       theme_void(base_size = 11) +
-      theme(plot.title = element_text(face = 'bold', size = 11, hjust = 0.5))
+      theme(plot.title = element_text(face = 'bold', size = 11, hjust = 0.5),
+            legend.position = if (show_leg) 'bottom' else 'none',
+            legend.text = element_text(size = 9))
   }
 
-  p_lc1985 <- make_lc_ggplot(1985)
-  p_lc2022 <- make_lc_ggplot(2022)
+  p_lc1985 <- make_lc_ggplot(1985, show_leg = FALSE)
+  p_lc2022 <- make_lc_ggplot(2022, show_leg = TRUE)
 
   # ── caption: where the invertebrate data come from ─────────────────────────
   macro_src  <- macro %>% filter(site_id %in% macro_here)
   n_events   <- nrow(distinct(macro_src, site_id, sample_date))
   yr_rng     <- paste(range(macro_src$Year, na.rm = TRUE), collapse = '–')
+  n_orders   <- n_distinct(na.omit(macro_src$order))
+  n_genera   <- n_distinct(na.omit(macro_src$Genus))
   agency     <- paste(sort(unique(na.omit(macro_src$agency))), collapse = '; ')
   raemp_note <- if (all(macro_src$program == 'RAEMP'))
                   'the coal-industry Regional Aquatic Effects Monitoring Program (RAEMP)'
@@ -426,10 +466,12 @@ for (i in seq_along(comids_to_map)) {
     macro_desc <- paste0(length(macro_here), ' macroinvertebrate stations within the watershed')
   }
   invert_caption <- paste0(
-    'Invertebrate density and genus richness (black lines) are from ', macro_desc,
+    'Macroinvertebrate density and genus richness (black lines) are from ', macro_desc,
     ', operated by ', agency, ' (', raemp_note, '): ', n_events, ' benthic samples, ',
-    yr_rng, '. Water chemistry (Se, SO4, NO3) is from the reach-snapped monitoring station(s); ',
-    'land cover and cumulative mining are integrated over the full upstream watershed shown at right.')
+    yr_rng, '. All recorded taxa are included (no order-level filtering) — ', n_orders,
+    ' invertebrate orders and ', n_genera, ' genera. Water chemistry (Se, SO4, NO3) is from the ',
+    'reach-snapped monitoring station(s); land cover and cumulative mining are integrated over ',
+    'the full upstream watershed shown at right.')
 
   # ── assemble with patchwork ─────────────────────────────────────────────────
 
@@ -448,8 +490,8 @@ for (i in seq_along(comids_to_map)) {
   ggsave(out_png, combined, width = 16, height = 10, dpi = 300)
   message('Saved ', out_png)
 
-  # caption text emitted to stdout (kept off the figure) for copy-paste
-  cat('\n===== FIGURE CAPTION (comid ', poc_comid, ') =====\n', sep = '')
-  cat(invert_caption, '\n')
-  cat('=================================================\n')
+  # caption saved beside the figure (kept off the figure image itself)
+  cap_txt <- paste0('figs/all_trends_comid_', poc_comid, out_suffix, '_caption.txt')
+  writeLines(invert_caption, cap_txt)
+  message('Wrote caption: ', cap_txt)
 }
